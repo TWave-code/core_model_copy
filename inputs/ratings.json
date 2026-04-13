@@ -1,0 +1,51 @@
+[
+    {
+        "min_score": 95,
+        "max_score": 100,
+        "rating": "AAA",
+        "rrc_desc": "Very low risk",
+        "rrc_capital_pct": 0.01
+    },
+    {
+        "min_score": 90,
+        "max_score": 95,
+        "rating": "AA",
+        "rrc_desc": "Low risk",
+        "rrc_capital_pct": 0.015
+    },
+    {
+        "min_score": 80,
+        "max_score": 90,
+        "rating": "A",
+        "rrc_desc": "Moderate risk",
+        "rrc_capital_pct": 0.02
+    },
+    {
+        "min_score": 70,
+        "max_score": 80,
+        "rating": "BBB",
+        "rrc_desc": "Medium risk",
+        "rrc_capital_pct": 0.03
+    },
+    {
+        "min_score": 60,
+        "max_score": 70,
+        "rating": "BB",
+        "rrc_desc": "Somewhat risky",
+        "rrc_capital_pct": 0.05
+    },
+    {
+        "min_score": 40,
+        "max_score": 60,
+        "rating": "B",
+        "rrc_desc": "High risk",
+        "rrc_capital_pct": 0.07
+    },
+    {
+        "min_score": 0,
+        "max_score": 40,
+        "rating": "CCC",
+        "rrc_desc": "Very high risk",
+        "rrc_capital_pct": 0.10
+    }
+]
