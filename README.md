@@ -1,4 +1,4 @@
-# BA Internal Risk Model
+# CORE - Collateralized Onchain Risk Engine
 
 A quantitative framework for computing **Capital Requirement Ratios (CRR)** across over-collateralised DeFi lending protocols. The model combines ARMA-GARCH price simulation, copula-based cross-asset correlation, an optional compound Poisson jump component, and full liquidation mechanics to estimate **Value-at-Risk (VaR)** and **Expected Shortfall (ES)** of bad-debt exposure at a configurable confidence level.
 
@@ -8,12 +8,12 @@ A quantitative framework for computing **Capital Requirement Ratios (CRR)** acro
 
 | Protocol | Network | Data Source |
 |---|---|---|
-| **Morpho** | Ethereum | Internal PostgreSQL DB |
-| **Aave** | Ethereum / Arbitrum / Optimism | BlockAnalitica Sphere API |
-| **SparkLend** | Ethereum | BlockAnalitica Sphere API |
-| **Maple** | Ethereum | BlockAnalitica Sphere API |
-| **Galaxy** | — | Local CSV inputs |
-| **Anchorage** | — | Local CSV inputs |
+| **Morpho** | Ethereum | Local parquet inputs |
+| **Aave** | Ethereum / Arbitrum / Optimism | Local parquet inputs |
+| **SparkLend** | Ethereum | Local parquet inputs |
+| **Maple** | Ethereum | Local parquet inputs |
+| **Galaxy** | — | Local csv inputs |
+| **Anchorage** | — | Local csv inputs |
 
 ---
 
@@ -188,7 +188,7 @@ Selected GARCH model: GJR-GARCH
 Running Monte-Carlo Simulations for Prices...
 
 Simulated Prices Statistics for WBTC:
-              2026-04-10     2026-04-23
+            2026-04-10     2026-04-23
 mean        71,760.99      72,132.22
 std          1,511.87       6,727.74
 min         66,598.84      50,401.83
@@ -207,7 +207,7 @@ Delta LTV  at 99.50%:  26.50%
 
 ## Input Files (Galaxy / Anchorage)
 
-For protocols without a live API, place CSV files in the `inputs/` folder:
+For protocols without live updated positions, place CSV files in the `inputs/` folder:
 
 ```
 inputs/
