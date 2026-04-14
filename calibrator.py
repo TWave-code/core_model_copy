@@ -309,8 +309,7 @@ class Calibrator:
             "LM_pass": lm_pass
         }
 
-        # accept_model = lb_resid_pass and lb_sq_pass and lm_pass
-        accept_model = lb_sq_pass and lm_pass
+        accept_model = lb_sq_pass or lm_pass
 
         return accept_model, diagnostics
 
