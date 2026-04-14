@@ -157,46 +157,6 @@ class Liquidator:
 
 
     @staticmethod
-    def margin_call_function(
-        debt: np.ndarray,
-        collateral_value: np.ndarray,
-        margin_band_mask: np.ndarray,
-        margin_call_ltv: np.ndarray,
-        rng: np.random.Generator,
-        probability: float = 0.8,
-    ) -> np.ndarray:
-        """
-        Fast margin-call collateral addition.
-        Only acts on pre-filtered margin-band wallets.
-        """
-
-        add_collateral = np.zeros_like(debt)
-
-        idx = np.flatnonzero(margin_band_mask)
-        if idx.size == 0:
-            return add_collateral
-
-        u = rng.random(idx.size)
-        repay = u < probability
-        active_idx = idx[repay]
-
-        add = (debt / margin_call_ltv) - collateral_value
-        add_collateral[active_idx] = np.maximum(add[active_idx], 0.0)
-
-        # print("\nMargin call function invoked.")
-        # print(f"Current ltvs: {debt / collateral_value}")
-        # print(f"Collateral Value: {collateral_value}")
-
-        # print(f"Indices: {idx}")
-        # print(f"Random uniforms: {u}")
-        # print(f"Repay mask: {repay}")
-        # print(f"Active indexes: {active_idx}")
-        # print(f"Add collateral: {add_collateral}")
-
-        return add_collateral
-
-
-    @staticmethod
     def get_delta(
         cols, 
         default_delta=pd.Timedelta(hours=1)

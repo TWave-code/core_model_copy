@@ -51,14 +51,13 @@ For each market, the model reconstructs the full on-chain state at the simulatio
 - Liquidation threshold and liquidation bonus
 
 **Market-level inputs (per collateral asset):**
-- Daily OHLCV price history (up to 4 years, sourced from Yahoo Finance)
+- Daily OHLCV price history (sourced from Yahoo Finance with the deepest granularity)
 - Oracle price at simulation start
 - Real-time order book depth from 12+ CEX venues and Uniswap V3
 
 **Protocol parameters:**
 - Close factor rules (Aave / SparkLend)
 - Partial liquidation formula parameters (Morpho)
-- Margin call thresholds and cure probabilities (Maple / Galaxy)
 - Gas fee and swap fee assumptions
 
 ---
@@ -105,7 +104,7 @@ A candidate model is accepted only if it passes all three residual diagnostics:
 - **Ljung-Box** on squared standardised residuals (no remaining ARCH effects)
 - **ARCH-LM test** on standardised residuals (no remaining heteroskedasticity)
 
-Accepted candidates are then subject to a **rolling 1-step-ahead VaR backtest**. The model is trained on a window of `TRAIN_SIZE` days and the 1-day-ahead VaR is computed at level `backtest_alpha = 1 - PERC`. The window then rolls forward by 1 day, producing approximately (`N_history` − `TRAIN_SIZE`) non-overlapping hit observations — roughly 1 280 over a 4-year history with a 180-day training window. Two statistical tests are applied to the resulting hit sequence:
+Accepted candidates are then subject to a **rolling 1-step-ahead VaR backtest**. The model is trained on a window of `TRAIN_SIZE` days and the 1-day-ahead VaR is computed at level `backtest_alpha = 1 - PERC`. The window then rolls forward by 1 day, producing approximately (`N_history` − `TRAIN_SIZE`) non-overlapping hit observations. Two statistical tests are applied to the resulting hit sequence:
 
 - **Kupiec POF test** — tests unconditional coverage: does the observed exceedance rate match `backtest_alpha`?
 - **Christoffersen test** — tests conditional coverage: are exceedances independent over time?
@@ -243,7 +242,7 @@ Slippage is computed from a synthetic order book aggregated across 12+ CEX venue
 2. Computes the average execution price by consuming order book depth sequentially
 3. Derives slippage as the deviation of average execution price from the mid price
 
-The order book is fetched once at simulation start and held static over the forecast horizon. This is a conservative assumption: in a real stress event, liquidity is likely to thin further as prices decline.
+The order book is fetched once at simulation start and held static over the forecast horizon. Crucially, liquidity is consumed cumulatively across liquidation events: each successive liquidation starts from the point in the order book where the previous one left off, rather than assuming a fully replenished book. This is a conservative assumption — in a real stress event, market depth is likely to thin further as prices decline, and sequential liquidations would face progressively worse execution prices.
 
 ### 6.7 Bad Debt Accounting
 
@@ -290,7 +289,6 @@ ES is the preferred metric for capital setting because it is coherent (subadditi
 
 | Limitation | Impact |
 |---|---|
-| Static order books | Liquidity may deteriorate during stress; the model likely understates slippage in severe scenarios |
 | No cascading liquidations | Large-scale simultaneous selling depresses prices further; second-order market impact is not modelled |
 | No interest rate dynamics | Borrow rates spike during high-utilisation stress events; fixed-rate assumption is optimistic |
 | Oracle risk not modelled | Stale oracles or oracle manipulation are not captured |
@@ -300,7 +298,6 @@ ES is the preferred metric for capital setting because it is coherent (subadditi
 
 **Key observations:**
 - Hourly liquidation granularity materially reduces CRR relative to daily, reflecting realistic continuous liquidation dynamics. Daily-only simulation is the more conservative, prudential configuration.
-- The CORE consistently produces higher CRR estimates than the Lending Model, particularly under daily assumptions, due to more explicit slippage and profitability modelling.
 - In addition to CRR, the model provides PL, PD, and Delta LTV, giving a richer view of the risk drivers beyond a single capital number.
 
 ---
