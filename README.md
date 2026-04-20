@@ -217,10 +217,11 @@ CORE/
 ├── requirements.txt
 ├── README.md
 ├── inputs/
-│   ├── galaxy_users.csv
-│   ├── galaxy_market.csv
-│   ├── anchorage_users.csv
-│   └── anchorage_market.csv
+│   ├── galaxy_users.parquet
+│   ├── galaxy_market.parquet
+│   ├── anchorage_users.parquet
+|   ├── anchorage_market.parquet
+│   └── ...
 ├── documentation/
     └── internal_model_doc.md
 ```
