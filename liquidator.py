@@ -5,7 +5,7 @@
 # of the simulated price paths.
 # Swap fee --> Fixed 
 # Gas fee --> Fixed
-# Slippage --> Sphere based or Hyperlend based or Uniswap V3-based
+# Slippage --> CEXs based or Hyperlend based or Uniswap V3-based
 # ============================================================
 
 import pandas as pd
@@ -157,6 +157,46 @@ class Liquidator:
 
 
     @staticmethod
+    def margin_call_function(
+        debt: np.ndarray,
+        collateral_value: np.ndarray,
+        margin_band_mask: np.ndarray,
+        margin_call_ltv: np.ndarray,
+        rng: np.random.Generator,
+        probability: float = 0.8,
+    ) -> np.ndarray:
+        """
+        Fast margin-call collateral addition.
+        Only acts on pre-filtered margin-band wallets.
+        """
+
+        add_collateral = np.zeros_like(debt)
+
+        idx = np.flatnonzero(margin_band_mask)
+        if idx.size == 0:
+            return add_collateral
+
+        u = rng.random(idx.size)
+        repay = u < probability
+        active_idx = idx[repay]
+
+        add = (debt / margin_call_ltv) - collateral_value
+        add_collateral[active_idx] = np.maximum(add[active_idx], 0.0)
+
+        # print("\nMargin call function invoked.")
+        # print(f"Current ltvs: {debt / collateral_value}")
+        # print(f"Collateral Value: {collateral_value}")
+
+        # print(f"Indices: {idx}")
+        # print(f"Random uniforms: {u}")
+        # print(f"Repay mask: {repay}")
+        # print(f"Active indexes: {active_idx}")
+        # print(f"Add collateral: {add_collateral}")
+
+        return add_collateral
+
+
+    @staticmethod
     def get_delta(
         cols, 
         default_delta=pd.Timedelta(hours=1)
@@ -174,6 +214,130 @@ class Liquidator:
         return default_delta
 
 
+    @staticmethod
+    def compute_run_stats(
+        summary_df: pd.DataFrame,
+        tot_debt: float | None,
+        perc: float = 0.975,
+        users_df: pd.DataFrame | None = None,
+    ) -> dict:
+        """
+        Compute summary statistics for a completed simulation run.
+
+        Parameters
+        ----------
+        summary_df : DataFrame returned by simulate_liquidations()
+        tot_debt   : total loan exposure in USD (denominator for CRR)
+        perc       : confidence level for VaR / ES (e.g. 0.975 = 97.5th pct)
+        users_df   : borrower-level DataFrame — used to compute concentration metrics
+                    (HHI, top-1 share). Optional; metrics are None if not provided.
+
+        Returns
+        -------
+        dict with keys:
+            n_scenarios         : int   — total number of MC scenarios
+            prob_no_bad_debt    : float — fraction of scenarios with zero bad debt (0–1)
+            prob_bad_debt       : float — fraction of scenarios with any bad debt (0–1)
+            max_bad_debt_usd    : float — worst-case bad debt across all scenarios
+            max_bad_debt_pct    : float | None — max_bad_debt_usd / tot_debt * 100
+            mean_bad_debt_usd   : float | None — mean bad debt conditional on bad_debt > 0
+            mean_crr            : float | None — EL = E[bad_debt] / tot_debt * 100 (Basel EL)
+            crr_var             : float | None — CRR VaR at confidence level (%)
+            crr_es              : float | None — CRR ES  at confidence level (%)
+            es_el_ratio         : float | None — crr_es / mean_crr (concentration diagnostic)
+            hhi                 : float | None — Herfindahl-Hirschman Index of borrower
+                                                exposures (0=granular, 1=single borrower)
+            top1_share          : float | None — largest single borrower's share of tot_debt
+            n_borrowers         : int   | None — number of active borrowers
+        """
+        import numpy as np
+
+        _empty = {
+            "n_scenarios":       0,
+            "prob_no_bad_debt":  None,
+            "prob_bad_debt":     None,
+            "max_bad_debt_usd":  None,
+            "max_bad_debt_pct":  None,
+            "mean_bad_debt_usd": None,
+            "mean_crr":          None,
+            "crr_var":           None,
+            "crr_es":            None,
+            "es_el_ratio":       None,
+            "hhi":               None,
+            "top1_share":        None,
+            "n_borrowers":       None,
+        }
+
+        if summary_df is None or summary_df.empty:
+            return _empty
+
+        bad_debt = summary_df["net_bad_debt_total"]
+        n        = len(bad_debt)
+
+        prob_no_bad_debt  = float((bad_debt == 0).mean())
+        prob_bad_debt     = 1.0 - prob_no_bad_debt
+        max_bad_debt_usd  = float(bad_debt.max())
+
+        tail_vals         = bad_debt[bad_debt > 0]
+        mean_bad_debt_usd = float(tail_vals.mean()) if len(tail_vals) > 0 else None
+
+        max_bad_debt_pct = (
+            round(max_bad_debt_usd / tot_debt * 100, 6)
+            if (tot_debt is not None and tot_debt > 0)
+            else None
+        )
+
+        crr_var = crr_es = mean_crr = es_el_ratio = None
+        if tot_debt is not None and tot_debt > 0:
+            crr       = bad_debt / tot_debt * 100
+            crr_var   = round(float(np.quantile(crr, perc, method="inverted_cdf")), 6)
+            n_tail    = max(1, int(np.ceil((1 - perc) * n)))
+            crr_es    = round(float(crr.nlargest(n_tail).mean()), 6)
+            mean_crr  = round(float(bad_debt.mean()) / tot_debt * 100, 6)
+            if mean_crr and mean_crr > 0:
+                es_el_ratio = round(crr_es / mean_crr, 1)
+
+        # ── Concentration metrics from borrower-level data ────────────────────
+        hhi = top1_share = n_borrowers = None
+        if (
+            users_df is not None
+            and not users_df.empty
+            and "total_borrow_usd" in users_df.columns
+        ):
+            borrow      = users_df["total_borrow_usd"].fillna(0)
+            active      = borrow[borrow > 0]
+            n_borrowers = int(len(active))
+            if n_borrowers > 0 and active.sum() > 0:
+                shares     = active / active.sum()
+                hhi        = round(float((shares ** 2).sum()), 6)
+                top1_share = round(float(shares.max()), 6)
+
+        # ── Concentration-adjusted CRR ────────────────────────────────────────
+        # CRR_adj = EL × (1 + k × HHI)
+        #   HHI = 0  (granular)     : CRR_adj = EL
+        #   HHI = 1  (single name)  : CRR_adj = EL × (1 + k)   e.g. 2×EL when k=1
+        # crr_adj = None
+        # _CRR_HHI_K = 1.0  # tunable parameter for how much to adjust CRR based on HHI
+        # if mean_crr is not None:
+        #     _w      = hhi if hhi is not None else 0.0
+        #     crr_adj = round(mean_crr * (1 + _CRR_HHI_K * _w), 6)
+
+        return {
+            "n_scenarios":       n,
+            "prob_no_bad_debt":  prob_no_bad_debt,
+            "prob_bad_debt":     prob_bad_debt,
+            "max_bad_debt_usd":  max_bad_debt_usd,
+            "max_bad_debt_pct":  max_bad_debt_pct,
+            "mean_bad_debt_usd": mean_bad_debt_usd,
+            "mean_crr":          mean_crr,
+            "crr_var":           crr_var,
+            "crr_es":            crr_es,
+            "es_el_ratio":       es_el_ratio,
+            "hhi":               hhi,
+            "top1_share":        top1_share,
+            "n_borrowers":       n_borrowers,
+        }
+
 
     def simulate_liquidations(
         self,
@@ -182,8 +346,22 @@ class Liquidator:
         *,
         swap_fee: float = 0.0,
         gas_fee_usd: float = 0.0,
-        perc: float = 0.995
+        perc: float = 0.995,
+        protection_usd: float = 0.0,
+        margin_call_trigger: float = 0.05,
+        margin_call_target_ltv: float | None = None,
+        margin_call_cure_prob: float = 0.8,
     ) -> dict:
+        """
+        margin_call_trigger      : pp buffer below LT that triggers a margin call.
+                                A position triggers when LTV >= LT - margin_call_trigger.
+                                Default 0.05 means margin call fires at LTV >= LT - 5pp.
+        margin_call_target_ltv   : LTV the borrower restores to on cure.
+                                None (default) → restore to the borrower's initial LTV.
+                                A float (e.g. LT - 0.15) → restore to that fixed target.
+        margin_call_cure_prob    : probability that a borrower in the margin-call zone
+                                actually cures (posts collateral). Default 0.8.
+        """
         """
         Profit-aware simulation with 'count bad debt once' semantics.
 
@@ -302,6 +480,27 @@ class Liquidator:
         if np.any(denom >= 0):
             raise ValueError("Invalid params: -1 + LT*(1+bonus) must be < 0.")
 
+        # ── Margin call setup ─────────────────────────────────────────────────
+        # Applies to SYRUP (Maple) and ANCHORAGE only.
+        # A margin call fires when a borrower's LTV enters the zone [LT - trigger, LT).
+        # The borrower then has a `cure_prob` chance of posting additional collateral
+        # to restore their LTV to the target. Each borrower can self-cure at most once
+        # per scenario (further breaches are treated as defaults).
+        _MC_PROTOCOLS = {"SYRUP", "ANCHORAGE", "MAPLE"}
+        use_margin_call = any(p in product.upper() for p in _MC_PROTOCOLS)
+
+        LT_arr     = self.LT.values                        # shape (N_BORROW,)
+        LTV_init   = np.array(self.LTV, dtype=np.float64) # initial LTV per borrower
+
+        # Target LTV on cure: explicit value or fall back to borrower's initial LTV
+        if margin_call_target_ltv is not None:
+            mc_target = np.full(N_BORROW, margin_call_target_ltv, dtype=np.float64)
+        else:
+            mc_target = LTV_init.copy()
+
+        # Trigger threshold: LTV >= LT - margin_call_trigger
+        mc_trigger_ltv = LT_arr - margin_call_trigger     # shape (N_BORROW,)
+
         debt_repaid_totals   = np.zeros(N_SCEN)
         collat_liq_totals    = np.zeros(N_SCEN)
         ead_totals           = np.zeros(N_SCEN)  # sum of first defaults
@@ -332,10 +531,46 @@ class Liquidator:
             ltv_list = [0.0]
             D_adj  = np.zeros(N_BORROW)
             CV_adj = np.zeros(N_BORROW)
+
+            # Each borrower gets at most one self-cure per scenario.
+            # After curing, further LT breaches are treated as real defaults.
+            margin_called = np.zeros(N_BORROW, dtype=bool)
+
+            # Seeded RNG for margin-call cure draws — reproducible per scenario.
+            mc_rng = np.random.default_rng(self.seed + s)
+
             for t in range(T):
                 D = borrow_usd_tensor[:, s, t] + D_adj
                 CV = supply_usd_tensor[:, s, t] + CV_adj
-                    
+
+                # ── Margin call (SYRUP / ANCHORAGE only) ─────────────────────
+                # Fires before the liquidation check. Borrowers in the margin
+                # band [LT - trigger, LT) who have not yet cured this scenario
+                # have a `cure_prob` chance of posting collateral to restore
+                # their LTV to mc_target.
+                if use_margin_call:
+                    current_ltv = D / np.maximum(CV, 1e-12)
+                    in_band = (
+                        (current_ltv >= mc_trigger_ltv) &  # LTV entered the warning zone
+                        (current_ltv <  LT_arr)         &  # not yet breached LT
+                        (~margin_called)                    # hasn't already cured
+                    )
+                    if in_band.any():
+                        added = Liquidator.margin_call_function(
+                            debt=D,
+                            collateral_value=CV,
+                            margin_band_mask=in_band,
+                            margin_call_ltv=mc_target,
+                            rng=mc_rng,
+                            probability=margin_call_cure_prob,
+                        )
+                        # Mark borrowers who actually posted collateral as cured
+                        cured = in_band & (added > 0)
+                        CV_adj[cured] += added[cured]
+                        margin_called[cured] = True
+                        # Recompute CV after cure before the liquidation check
+                        CV = supply_usd_tensor[:, s, t] + CV_adj
+
                 hf = (CV * self.LT.values) / np.maximum(D, 1e-12)
                 unsafe = hf < 1.0
 
@@ -397,7 +632,11 @@ class Liquidator:
                 do_exec = feasible & profitable
                 for token in modeled_tokens:
                     token_mask = do_exec & (best_token_arr == token)
-                    consumed_per_token[token] += float(np.sum(R_req[token_mask]))
+                    # Liquidators seize collateral worth R_req × (1 + bonus), not R_req.
+                    # The order book is denominated in collateral USD, so we must consume
+                    # the seized collateral amount — not the debt repaid — to correctly
+                    # track cumulative book depletion across sequential liquidations.
+                    consumed_per_token[token] += float(np.sum(R_req[token_mask] * one_plus_bonus[token_mask]))
 
                 ever_liquidated |= do_exec
 
@@ -405,7 +644,7 @@ class Liquidator:
                 R = np.where(do_exec, R_req, 0.0)
                 seized_collat_usd = (one_plus_bonus * R)
                 each_user_loss += liq_bonus * R
-               
+            
                 D_adj  -= R
                 CV_adj -= seized_collat_usd
 
@@ -449,13 +688,22 @@ class Liquidator:
             pct_user_liq[s]         = int(ever_liquidated.sum()) / N_BORROW
             pct_user_default[s]     = n_users_defaulting / N_BORROW
 
-        net_bad_debt_total = np.maximum(0.0, ead_totals - recoveries_totals)
-       
+        gross_bad_debt_total = np.maximum(0.0, ead_totals - recoveries_totals)
+
+        # ── Apply defense mechanisms (FLC, subsidies, etc.) ───────────────────
+        # Each scenario's bad debt is reduced by the total protection available,
+        # floored at 0 (protection cannot create a profit).
+        if protection_usd > 0:
+            net_bad_debt_total = np.maximum(0.0, gross_bad_debt_total - protection_usd)
+        else:
+            net_bad_debt_total = gross_bad_debt_total
+
         scen_names = np.arange(N_SCEN)           # or whatever label you want
         summary = pd.DataFrame({
             'scenario': scen_names,
             'bad_debt_ead_total': ead_totals,
             'recoveries_total': recoveries_totals,
+            'gross_bad_debt_total': gross_bad_debt_total,
             'net_bad_debt_total': net_bad_debt_total,
             'debt_repaid_total': debt_repaid_totals,
             'collateral_liquidated_total': collat_liq_totals,
@@ -467,13 +715,20 @@ class Liquidator:
             'prob_of_default': pct_user_default
         })
 
-        summary_df = summary[['scenario', 'max_delta_ltv', 'net_bad_debt_total', 
-                              'max_pct_loss', 'prob_of_liq', 'prob_of_default']].copy().reset_index(drop=True)
+        summary_df = summary[['scenario', 'max_delta_ltv', 'net_bad_debt_total', 'gross_bad_debt_total',
+                            'max_pct_loss', 'prob_of_liq', 'prob_of_default']].copy().reset_index(drop=True)
         
         bad_debt_var = np.quantile(summary_df['net_bad_debt_total'], perc, method='inverted_cdf')
-        bad_debt_es = summary_df['net_bad_debt_total'][summary_df['net_bad_debt_total'] >= bad_debt_var].mean()
+        bad_debt_var_gross = np.quantile(summary_df['gross_bad_debt_total'], perc, method='inverted_cdf')
+
+        # ES: always average the top ceil((1-perc)*N) scenarios by rank, regardless of ties.
+        # Using >= bad_debt_var would include ALL zero-loss rows when VaR=0, inflating the tail set.
+        n_tail = max(1, int(np.ceil((1 - perc) * len(summary_df))))
+        bad_debt_es = summary_df['net_bad_debt_total'].nlargest(n_tail).mean()
+        bad_debt_es_gross = summary_df['gross_bad_debt_total'].nlargest(n_tail).mean()
         crr = bad_debt_var / TOT_DEBT
         es = bad_debt_es / TOT_DEBT
+        es_gross = bad_debt_es_gross / TOT_DEBT
 
         bins = [0.0, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 1.0]
         labels = [
@@ -510,10 +765,36 @@ class Liquidator:
             )
         print("--------------------------------\n")
 
-        print(f"\nCRR as ES at {perc:.2%}: {es:.4%}")
-        print(f"CRR as VaR at {perc:.2%}: {crr:.4%}")
-        print(f"PL at {perc:.2%}: {np.quantile(summary_df['prob_of_liq'], perc, method='inverted_cdf'):.4%}")
-        print(f"PD at {perc:.2%}: {np.quantile(summary_df['prob_of_default'], perc, method='inverted_cdf'):.4%}")
+        # ── Headline CRR metrics ──────────────────────────────────────────────
+        # EL  = mean(net_bad_debt) / TOT_DEBT  (Basel Expected Loss)
+        # HHI = borrower concentration index
+        # adj = (1 − HHI) × EL + HHI × ES     (concentration-adjusted CRR)
+        crr_el_raw = float(summary_df['net_bad_debt_total'].mean()) / TOT_DEBT  # ratio 0-1
+
+        _hhi = None
+        if "total_borrow_usd" in self.user_df.columns:
+            _borrow = self.user_df["total_borrow_usd"].fillna(0)
+            _active = _borrow[_borrow > 0]
+            if len(_active) > 0 and _active.sum() > 0:
+                _shares = _active / _active.sum()
+                _hhi    = float((_shares ** 2).sum())
+
+        _w          = _hhi if _hhi is not None else 0.0
+        # _CRR_HHI_K: float = 1.0
+        # crr_adj_raw = crr_el_raw * (1 + _CRR_HHI_K * _w)
+
+        # print(f"\nCRR as Net ES at {perc:.2%}: {es:.4%}")
+        # print(f"CRR as Gross ES at {perc:.2%}: {es_gross:.4%}")
+        # print(f"CRR as VaR at {perc:.2%}: {crr:.4%}")
+        print(f"CRR as EL: {crr_el_raw:.4%}")
+        # print(f"PL at {perc:.2%}: {np.quantile(summary_df['prob_of_liq'], perc, method='inverted_cdf'):.4%}")
+        # print(f"PD at {perc:.2%}: {np.quantile(summary_df['prob_of_default'], perc, method='inverted_cdf'):.4%}")
         print(f"Delta LTV at {perc:.2%}: {np.quantile(summary_df['max_delta_ltv'], perc, method='inverted_cdf'):.4%}\n")
-        
-        return summary_df
+
+        return {
+            "summary_df": summary_df,
+            "crr_el":     round(crr_el_raw  * 100, 6),   # % units
+            "crr_es":     round(es          * 100, 6),   # % units
+            "crr_var":    round(crr         * 100, 6),   # % units
+            "hhi":        round(_hhi, 6) if _hhi is not None else None,
+        }

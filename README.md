@@ -1,19 +1,18 @@
 # CORE - Collateralized Onchain Risk Engine
 
-A quantitative framework for computing **Capital Requirement Ratios (CRR)** across over-collateralised DeFi lending protocols. The model combines ARMA-GARCH price simulation, copula-based cross-asset correlation, an optional compound Poisson jump component, and full liquidation mechanics to estimate **Value-at-Risk (VaR)** and **Expected Shortfall (ES)** of bad-debt exposure at a configurable confidence level.
+A quantitative framework for computing the **Capital Requirement Ratio (CRR)** across over-collateralised DeFi lending protocols. The model combines ARMA-GARCH price simulation, copula-based cross-asset correlation, an optional compound Poisson jump component, and full liquidation mechanics to estimate the **Expected Loss (EL)** of bad-debt exposure — the primary risk metric — together with concentration diagnostics based on the Herfindahl-Hirschman Index (HHI) of borrower exposures.
 
 ---
 
 ## Supported Protocols
 
-| Protocol | Network | Data Source |
-|---|---|---|
-| **Morpho** | Ethereum | Local parquet inputs |
-| **Aave** | Ethereum / Arbitrum / Optimism | Local parquet inputs |
-| **SparkLend** | Ethereum | Local parquet inputs |
-| **Maple** | Ethereum | Local parquet inputs |
-| **Galaxy** | — | Local csv inputs |
-| **Anchorage** | — | Local csv inputs |
+| Protocol | Data Source |
+|---|---|
+| **Morpho** | Parquet files |
+| **SparkLend** | Parquet files |
+| **Maple** | Parquet files |
+| **Galaxy** | Parquet files |
+| **Anchorage** | Parquet files |
 
 ---
 
@@ -22,7 +21,7 @@ A quantitative framework for computing **Capital Requirement Ratios (CRR)** acro
 ```
 main.py               Entry point — orchestrates the full pipeline
 │
-├── importer.py       Protocol-specific data loaders (users + market data)
+├── importer.py       Protocol-specific data loaders (users + market data) and prices / orderbook data
 │
 ├── calibrator.py     ARMA / GARCH-family model selection, diagnostics, backtesting
 │   └── backtester.py Rolling VaR backtests (Kupiec + Christoffersen)
@@ -37,12 +36,12 @@ main.py               Entry point — orchestrates the full pipeline
 
 | Step | Module | Description |
 |---|---|---|
-| 1 | `importer.py` | Import borrower positions and market parameters |
+| 1 | `importer.py` | Fetch live borrower positions and market parameters |
 | 2 | `calibrator.py` | Fit ARMA(p,q)-GARCH-family models on daily log returns; select best specification by BIC; validate with ARCH-LM diagnostics and rolling Kupiec / Christoffersen backtests |
 | 3 | `calibrator.py` | Optionally fit a compound Poisson jump process with Student-t jump sizes to tail return observations |
 | 4 | `forecaster.py` / `aggregator.py` | Generate `N_MC` correlated price scenarios via a Gaussian or t-Copula; optionally decompose to hourly resolution using a Brownian bridge |
 | 5 | `liquidator.py` | For each scenario, apply protocol-specific liquidation rules, compute liquidator profit (after gas and slippage), and accumulate bad debt |
-| 6 | `liquidator.py` | Compute VaR and ES of the bad-debt distribution at the configured percentile |
+| 6 | `liquidator.py` | Compute the Expected Loss (EL) and concentration-adjusted CRR from the bad-debt distribution |
 
 ---
 
@@ -51,9 +50,9 @@ main.py               Entry point — orchestrates the full pipeline
 | Parameter | Default | Description |
 |---|---|---|
 | `PROTOCOL` | `MORPHO` | Target protocol |
-| `NETWORK` | `ETHEREUM` | Target network |
+| `NETWORK` | `ETHEREUM` | Target network (useless in this script) |
 | `FORECAST_STEP` | `14` | Forecast horizon (days) |
-| `TRAIN_SIZE` | `90` | Rolling training window (days) |
+| `TRAIN_SIZE` | `180` | Rolling training window (days) |
 | `N_MC` | `10 000` | Monte Carlo scenarios |
 | `PERC` | `0.975` | VaR / ES confidence level |
 | `COPULA_TYPE` | `T-COPULA` | Cross-asset dependence structure (`GAUSSIAN` or `T-COPULA`) |
@@ -119,7 +118,7 @@ profit   = proceeds − R_req − gas_fee_usd  ≥ 0
 If the constraint is not met, the position is marked as bad debt equal to the full exposure at default (EAD). Subsequent scenario steps where partial recovery becomes viable reduce the net bad debt figure.
 
 ### Slippage
-Slippage is modelled from aggregated real-time order books across 12+ CEX venues and Uniswap V3. Available depth at each price level is used to compute the average execution price for the required liquidation size. The order book is static over the forecast horizon.
+Slippage is modelled from aggregated real-time order books across 12+ CEX venues and Uniswap V3. Available depth at each price level is used to compute the average execution price for the required liquidation size. The order book is dynamic over the forecast horizon in the sense that the liquidity is consumed as liquidations happen.
 
 ---
 
@@ -138,15 +137,15 @@ Setting `LOAN_TOKEN = "ALL"` analyses the full mixed-borrow portfolio; setting i
 
 ## Risk Metrics
 
-All metrics are reported at the `PERC` confidence level across the `N_MC` simulated scenarios:
-
 | Metric | Definition |
 |---|---|
-| **CRR (VaR)** | `PERC`-quantile of (Net Bad Debt / Total Exposure) |
-| **CRR (ES)** | Mean of (Net Bad Debt / Total Exposure) for scenarios beyond the VaR |
+| **CRR (EL)** | Mean (Net Bad Debt / Total Exposure) across all `N_MC` scenarios — the Basel Expected Loss analog; the primary headline metric |
+| **HHI** | Herfindahl-Hirschman Index of borrower exposures: `Σ (borrow_i / total_borrow)²`; ranges from 0 (perfectly granular) to 1 (single borrower) |
 | **PL** | `PERC`-quantile of the fraction of positions liquidated |
 | **PD** | `PERC`-quantile of the fraction of positions generating bad debt |
 | **Delta LTV** | `PERC`-quantile of the maximum LTV overshoot above the liquidation threshold |
+
+CRR (EL) is the headline metric. It equals `PD × LGD × EAD` in Basel notation — the expected cost of lending expressed as a fraction of total exposure. It is stable under borrower concentration and directly comparable across protocols and market segments. VaR and ES of the bad-debt distribution are computed internally and available as diagnostics but are not the primary output.
 
 ---
 
@@ -196,8 +195,8 @@ max         78,439.61      99,453.16
 
 Running Monte-Carlo for Liquidations...
 
-CRR as ES  at 99.50%:  23.52%
-CRR as VaR at 99.50%:  17.05%
+CRR as EL (Basel):     2.34%
+HHI (concentration):   0.142
 PL         at 99.50%:  50.00%
 PD         at 99.50%:  50.00%
 Delta LTV  at 99.50%:  26.50%
@@ -205,24 +204,10 @@ Delta LTV  at 99.50%:  26.50%
 
 ---
 
-## Input Files (Galaxy / Anchorage)
-
-For protocols without live updated positions, place CSV files in the `inputs/` folder:
-
-```
-inputs/
-├── galaxy_users.csv
-├── galaxy_market.csv
-├── anchorage_users.csv
-└── anchorage_market.csv
-```
-
----
-
 ## Project Structure
 
 ```
-Internal_Model/
+CORE/
 ├── main.py
 ├── importer.py
 ├── calibrator.py
@@ -237,6 +222,6 @@ Internal_Model/
 │   ├── galaxy_market.csv
 │   ├── anchorage_users.csv
 │   └── anchorage_market.csv
-└── documentation/
+├── documentation/
     └── internal_model_doc.md
 ```

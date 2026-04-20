@@ -309,6 +309,7 @@ class Calibrator:
             "LM_pass": lm_pass
         }
 
+        # accept_model = lb_sq_pass and lm_pass
         accept_model = lb_sq_pass or lm_pass
 
         return accept_model, diagnostics
@@ -500,9 +501,9 @@ class Calibrator:
                 )
 
         if best_garch_fitted is None and not has_arch_effects:
-            best_arima = None
-            model = None
-            arima_spech = None
+            # No ARCH effects detected — GARCH is not warranted, but the already-fitted
+            # ARMA model is still a valid mean forecast and must be kept. Only discard
+            # the GARCH spec; setting best_arima to None here would crash returns_forecasting.
             garch_cand_spech = None
 
         return best_arima, best_garch_fitted, arima_spech, garch_cand_spech

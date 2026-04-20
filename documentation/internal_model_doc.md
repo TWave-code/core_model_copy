@@ -1,8 +1,10 @@
-# CORE — Methodology
+# CORE — Collateralized Onchain Risk Engine
 
 ---
 
 ## TL;DR
+
+The Collateralized Onchain Risk Engine (CORE) is a modular Monte Carlo stress-testing framework designed to quantify downside risk in over-collateralised lending protocols. It simulates many possible future price paths for collateral assets, checks every borrower position step by step, executes liquidations subject to realistic market frictions, and measures how much bad debt accumulates.
 
 The model answers three practical questions:
 - **How often do positions get liquidated?** (Probability of Liquidation, PL)
@@ -15,11 +17,13 @@ The model answers three practical questions:
 
 | Term | Definition |
 |---|---|
-| **CRR** | Capital Requirement Ratio — bad debt as a fraction of total exposure, at a given confidence level |
+| **CRR** | Capital Requirement Ratio — bad debt as a fraction of total exposure |
+| **EL** | Expected Loss — mean CRR across all Monte Carlo scenarios; the primary headline metric; equals PD × LGD × EAD in Basel notation (here CRR = EL) |
+| **HHI** | Herfindahl-Hirschman Index — `Σ (borrow_i / total_borrow)²`; measures borrower concentration; 0 = perfectly granular, 1 = single borrower |
 | **PL** | Probability of Liquidation — fraction of positions liquidated in a given scenario |
 | **PD** | Probability of Default — fraction of positions generating unrecovered bad debt |
-| **VaR** | Value at Risk — α-quantile of the loss distribution |
-| **ES** | Expected Shortfall — expected loss conditional on exceeding VaR |
+| **VaR** | Value at Risk — α-quantile of the loss distribution (diagnostic) |
+| **ES** | Expected Shortfall — expected loss conditional on exceeding VaR (diagnostic) |
 | **LTV** | Loan-to-Value ratio — outstanding debt / collateral value |
 | **LT** | Liquidation Threshold — LTV level at which a position becomes eligible for liquidation |
 | **HF** | Health Factor — (collateral value × LT) / debt; position is unsafe when HF < 1 |
@@ -36,7 +40,7 @@ The model integrates four components into a single pipeline:
 3. **Aggregator** — constructs cross-asset copula dependence
 4. **Liquidator** — simulates protocol-specific liquidation mechanics and computes bad debt
 
-All components share a common data flow: calibrated model parameters drive the simulation, simulated prices drive the liquidation engine, and liquidation outcomes are aggregated into tail risk metrics.
+All components share a common data flow: calibrated model parameters drive the simulation, simulated prices drive the liquidation engine, and liquidation outcomes are aggregated into risk metrics.
 
 ---
 
@@ -51,7 +55,7 @@ For each market, the model reconstructs the full on-chain state at the simulatio
 - Liquidation threshold and liquidation bonus
 
 **Market-level inputs (per collateral asset):**
-- Daily OHLCV price history (sourced from Yahoo Finance with the deepest granularity)
+- Daily OHLCV price history (sourced from Yahoo Finance)
 - Oracle price at simulation start
 - Real-time order book depth from 12+ CEX venues and Uniswap V3
 
@@ -95,7 +99,9 @@ Whether a GARCH model is warranted is determined by an **ARCH-LM test** on the r
 | **GARCH(1,1)** | `σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}` |
 | **EGARCH(1,1)** | `log σ²_t = ω + α·(|z_{t-1}| − E|z|) + γ·z_{t-1} + β·log σ²_{t-1}` |
 
-Each specification is tested with three innovation distributions: Normal, Student-t, and Skewed Student-t. The winning combination minimises BIC.
+Each specification is tested with three innovation distributions: Normal, Student-t, and Skewed Student-t. The winning combination minimises BIC. When a Student-t distribution is selected, the degrees-of-freedom parameter `ν` is estimated jointly with the other model parameters via maximum likelihood; this MLE-estimated value is used in all subsequent simulation steps (copula inverse-CDF transform and innovation sampling). A fixed or assumed `ν` is never used.
+
+**Fallback when no ARCH effects are detected.** If the ARCH-LM test does not detect heteroskedasticity (p ≥ 0.05), a GARCH model is not warranted. In this case the GARCH step is skipped entirely, but the fitted ARMA mean model is retained and used for forecasting with historical-volatility innovations. This preserves the mean dynamics without imposing unnecessary variance structure.
 
 ### 3.4 Model Validation
 
@@ -104,7 +110,7 @@ A candidate model is accepted only if it passes all three residual diagnostics:
 - **Ljung-Box** on squared standardised residuals (no remaining ARCH effects)
 - **ARCH-LM test** on standardised residuals (no remaining heteroskedasticity)
 
-Accepted candidates are then subject to a **rolling 1-step-ahead VaR backtest**. The model is trained on a window of `TRAIN_SIZE` days and the 1-day-ahead VaR is computed at level `backtest_alpha = 1 - PERC`. The window then rolls forward by 1 day, producing approximately (`N_history` − `TRAIN_SIZE`) non-overlapping hit observations. Two statistical tests are applied to the resulting hit sequence:
+Accepted candidates are then subject to a **rolling 1-step-ahead VaR backtest**. The model is trained on a window of `TRAIN_SIZE` days and the 1-day-ahead VaR is computed at level `backtest_alpha = 1 - PERC`. The window then rolls forward by 1 day, producing approximately (`N_history` − `TRAIN_SIZE`) non-overlapping hit observations — roughly 1 280 over a 4-year history with a 180-day training window. Two statistical tests are applied to the resulting hit sequence:
 
 - **Kupiec POF test** — tests unconditional coverage: does the observed exceedance rate match `backtest_alpha`?
 - **Christoffersen test** — tests conditional coverage: are exceedances independent over time?
@@ -123,8 +129,6 @@ vol_floor = Percentile(rolling_21d_std(r_t, full history), VOL_FLOOR_PCT)
 
 The floor is computed from the **full historical price series** (not the training window), ensuring it remains stable regardless of the window size used for model estimation. `VOL_FLOOR_PCT = 0.75` corresponds to the 75th percentile of historical realised volatility, keeping the model in the upper half of observed conditions.
 
-The 21-day rolling window is a convention, not a derived parameter. It approximates one trading month (21 business days), which is the standard lookback used in risk management for estimating "current" realized volatility: it's long enough to smooth out daily noise but short enough to be responsive to regime changes.
-
 ### 3.6 Jump Component (Optional)
 
 When `JUMPS = True`, a compound Poisson jump process is added to the return:
@@ -132,11 +136,13 @@ When `JUMPS = True`, a compound Poisson jump process is added to the return:
 ```
 J_t = N_t × j_t
 
-N_t ~ Poisson(λ)         jump occurrence
-j_t ~ Student-t(df, μ_j, σ_j)   jump size
+N_t ~ Poisson(λ)               jump occurrence
+j_t ~ Student-t(df, μ_j, σ_j)  jump size
 ```
 
-Parameters are estimated from the tail of the historical return distribution. By default, bilateral tails are used (returns below the 2.5th or above the 97.5th percentile). Setting `FOCUS_ON_NEGATIVE = True` restricts calibration to the left tail only, and clips simulated jumps to be non-positive, which is more conservative for liquidation risk.
+Jump parameters (λ, μ_j, σ_j, df) are **calibrated independently for each collateral token** from the tail of that token's historical return distribution. By default, bilateral tails are used (returns below the 2.5th or above the 97.5th percentile). Setting `FOCUS_ON_NEGATIVE = True` restricts calibration to the left tail only, and clips simulated jumps to be non-positive, which is more conservative for liquidation risk.
+
+In multi-token portfolios, each token's price path is generated using its own calibrated jump parameters, correctly reflecting heterogeneous tail behaviour across assets.
 
 ---
 
@@ -168,7 +174,7 @@ For single-token markets, uniform samples are drawn independently.
 For each of the `N_MC` Monte Carlo scenarios:
 
 1. Sample a row of `FORECAST_STEP` correlated uniform variates from the copula.
-2. Transform each uniform to an innovation via the fitted distribution's inverse CDF (t or Normal).
+2. Transform each uniform to an innovation via the fitted distribution's inverse CDF (t or Normal). When the fitted distribution is Student-t, the MLE-estimated degrees-of-freedom `ν` is used — not a fixed assumption — ensuring the simulated tail thickness matches what was observed in the data.
 3. Combine with GARCH conditional volatility forecast and ARMA mean forecast:
 
 ```
@@ -244,6 +250,8 @@ Slippage is computed from a synthetic order book aggregated across 12+ CEX venue
 
 The order book is fetched once at simulation start and held static over the forecast horizon. Crucially, liquidity is consumed cumulatively across liquidation events: each successive liquidation starts from the point in the order book where the previous one left off, rather than assuming a fully replenished book. This is a conservative assumption — in a real stress event, market depth is likely to thin further as prices decline, and sequential liquidations would face progressively worse execution prices.
 
+The amount consumed from the order book at each liquidation event is the **collateral seized**, not the debt repaid: seized collateral = R_req × (1 + bonus). This is correct because the order book is denominated in collateral-asset USD — the liquidator sells collateral to repay debt, so it is the sell-side collateral quantity that depletes the book.
+
 ### 6.7 Bad Debt Accounting
 
 Bad debt is recorded using "count once" semantics:
@@ -257,17 +265,29 @@ This correctly distinguishes between exposure at default and net economic loss.
 
 ## 7. Risk Metrics
 
-Scenario-level net bad debt figures are aggregated into tail risk metrics at the `PERC` confidence level:
+Scenario-level net bad debt figures are aggregated into the following metrics:
 
-| Metric | Definition |
-|---|---|
-| **CRR (VaR)** | α-quantile of (Net Bad Debt / Total Exposure) |
-| **CRR (ES)** | E[Net Bad Debt / Total Exposure \| scenario ≥ VaR] |
-| **PL** | α-quantile of the fraction of positions liquidated per scenario |
-| **PD** | α-quantile of the fraction of positions with net bad debt > 0 |
-| **Delta LTV** | α-quantile of the maximum LTV overshoot above LT across all positions |
+| Metric | Definition | Role |
+|---|---|---|
+| **CRR (EL)** | Mean (Net Bad Debt / Total Exposure) across all N scenarios | **Headline metric** |
+| **HHI** | `Σ (borrow_i / total_borrow)²` computed from the live borrower DataFrame | Concentration diagnostic |
+| **PL** | α-quantile of the fraction of positions liquidated per scenario | Liquidation activity |
+| **PD** | α-quantile of the fraction of positions with net bad debt > 0 | Default frequency |
+| **Delta LTV** | α-quantile of the maximum LTV overshoot above LT across all positions | Severity indicator |
 
-ES is the preferred metric for capital setting because it is coherent (subadditive) and more sensitive to the severity of tail scenarios, not just their frequency.
+### Why EL is the headline metric
+
+CRR (EL) equals `PD × LGD × EAD` in Basel notation — the expected cost of lending expressed as a fraction of total exposure. It is:
+
+- **Stable under concentration**: each scenario contributes equally to the mean regardless of whether one large borrower or many small borrowers drive the loss. ES, by contrast, averages only the worst tail and is dominated by whichever large concentrated position happens to default in those scenarios, producing numbers that can be an order of magnitude larger than EL for the same portfolio.
+- **Directly comparable across protocols**: different markets, loan tokens, and horizon assumptions all produce EL figures on the same scale, making cross-protocol ranking meaningful.
+- **Interpretable as a cost**: EL quantifies the average bad-debt expense per dollar lent, which maps directly to the spread required to break even on risk.
+
+### Concentration and EL
+
+A high HHI signals that EL is driven by a small number of large positions rather than a diversified pool. This does not make EL wrong, but it does change its interpretation: for a concentrated portfolio, EL reflects the expected loss in a world where that large borrower defaults with some frequency, and the confidence interval around EL is wide. The HHI is therefore shown alongside EL in the dashboard to provide context.
+
+VaR and ES are computed internally and remain available as diagnostics in `Liquidator.compute_run_stats()`, but they are not the primary reported output.
 
 ---
 
@@ -281,6 +301,7 @@ ES is the preferred metric for capital setting because it is coherent (subadditi
 | ARCH-LM gate for GARCH | Ljung-Box on levels detects mean autocorrelation, not variance clustering; ARCH-LM is the correct pre-test for GARCH |
 | 1-step-ahead backtest rolling by 1 day | Rolling by `FORECAST_STEP` days produces only ~90 non-overlapping windows over 4 years — too sparse for reliable Kupiec / Christoffersen tests. Rolling by 1 day gives ~1280 non-overlapping 1-day hits, providing proper statistical power. The 1-step-ahead horizon is the standard for VaR model validation; the multi-step simulation horizon is a separate concern. |
 | Soft backtest fallback | Hard rejection of all GARCH models when none passes formal tests causes a regression to constant-volatility forecasting; the least-bad GARCH candidate is always preferable |
+| ARMA retained when no ARCH effects | When no heteroskedasticity is detected, skipping GARCH does not mean discarding the mean model — the fitted ARMA is preserved and residuals are scaled by historical volatility, which is strictly better than reverting to a constant-mean random walk |
 | t-Copula over Gaussian | Crypto assets exhibit strong tail co-dependence; a Gaussian copula underestimates the probability of simultaneous crashes |
 | Volatility floor from full history | A floor computed from the training window is self-referential and moves with window size; anchoring to the full series gives a stable long-run stress reference |
 | Spearman over Pearson for correlation | Robust to outliers; captures monotonic relationships without requiring linearity |
@@ -293,6 +314,93 @@ ES is the preferred metric for capital setting because it is coherent (subadditi
 | No interest rate dynamics | Borrow rates spike during high-utilisation stress events; fixed-rate assumption is optimistic |
 | Oracle risk not modelled | Stale oracles or oracle manipulation are not captured |
 | Stablecoin collateral filtered | Peg risk for USDC, USDT, and crypto-backed stablecoins is not modelled; positions using stablecoin collateral are excluded from price simulation |
+
+---
+
+## 9. Expected Model Behaviour and Sensitivity
+
+This section documents the qualitative relationships between model inputs and outputs that a correctly functioning model should exhibit. These relationships serve as sanity checks when interpreting results and as a guide for parameter sensitivity analysis.
+
+### 9.1 Borrower LTV Level
+
+**Higher initial LTV → higher CRR.**
+
+A borrower at LTV = 0.80 with a liquidation threshold of LT = 0.85 requires only a 6% collateral price decline to be liquidated. A borrower at LTV = 0.60 requires a 29% decline. For a given volatility and horizon, a higher-LTV portfolio means a larger fraction of the simulated price distribution reaches the liquidation boundary, increasing both PL and the frequency of scenarios where liquidations fail to recover the full debt.
+
+In practice, CRR is highly non-linear in LTV: portfolios where most borrowers sit comfortably below LT (LTV < 0.70) will show near-zero CRR under typical volatility assumptions, while portfolios with LTV tightly clustered just below LT (LTV ≥ 0.80) can exhibit CRR that increases sharply with even modest changes in volatility or horizon.
+
+### 9.2 Collateral Volatility
+
+**Higher volatility → higher CRR. Longer forecast horizon → higher CRR.**
+
+The simulated price distribution widens as volatility increases, moving more scenarios into the tail where LTV breaches the liquidation threshold. This effect is compounded over the forecast horizon: for a random walk, the variance of cumulative log returns scales with the number of steps, so a 14-day horizon produces a distribution roughly √14 ≈ 3.7× wider than the 1-day distribution (all else equal).
+
+Consequently:
+- Tokens with high historical volatility (e.g. newer or less liquid assets) will always produce higher CRR than BTC or ETH under the same portfolio structure.
+- Extending the forecast horizon increases CRR monotonically, with diminishing marginal effect as the distribution becomes so wide that incremental steps move little additional probability mass into the loss region.
+- The volatility floor (`VOL_FLOOR_PCT`) prevents CRR from collapsing to near-zero during sustained low-volatility regimes by anchoring the minimum forecast volatility to the 75th percentile of historical realised vol.
+
+### 9.3 Portfolio Concentration
+
+**Few large borrowers → higher CRR than many small borrowers of equal total size.**
+
+Concentration risk operates through two distinct channels:
+
+**Channel 1 — Order book depth.** When a single large borrower is liquidated, the required sale size is proportionally large relative to the available market depth. Slippage is a convex function of trade size — doubling the sale amount more than doubles the price impact. A portfolio dominated by one large position therefore faces disproportionately poor liquidation execution, making it more likely that liquidations become unprofitable and the position converts to bad debt.
+
+**Channel 2 — Statistical diversification.** A portfolio of many small, partially independent borrowers benefits from diversification across idiosyncratic risk: not all positions will be at high LTV simultaneously, and the distribution of aggregate bad debt converges (by a law-of-large-numbers argument) around its mean. A single large borrower provides no such averaging — the outcome is effectively binary (liquidated or not), which is reflected in a heavier tail of the bad-debt distribution and a higher CRR at any given confidence level.
+
+As a rule of thumb, if the top-3 borrowers represent more than 50% of total exposure, concentration risk is a material driver of CRR. The model captures this correctly because it operates at individual-position level, not at portfolio-aggregate level.
+
+The HHI (Herfindahl-Hirschman Index) is computed from the live borrower DataFrame and reported alongside CRR (EL) in the dashboard. An HHI above 0.25 (equivalent to fewer than 4 equal-sized borrowers) indicates that the portfolio is concentrated and the EL should be read in that context. An HHI below 0.10 (more than 10 equivalent borrowers) indicates a sufficiently granular portfolio where EL is a reliable portfolio-wide measure.
+
+### 9.4 Order Book Depth and Collateral Liquidity
+
+**Thinner order books → higher CRR.**
+
+For a given liquidation size, thinner market depth implies higher slippage and a higher probability that the profitability constraint (`profit < 0`) prevents liquidation, converting the full position to bad debt. This effect is token-specific: BTC and ETH are supported by deep, aggregated CEX order books across 12+ venues, while smaller-cap tokens have substantially thinner depth.
+
+In multi-collateral portfolios, CRR is dominated by the most illiquid collateral token, even if that token represents a minority of total exposure, because it is in exactly those positions that liquidators are least likely to execute profitably under stress.
+
+### 9.5 Cross-Asset Correlation
+
+**Higher cross-asset correlation → higher CRR.**
+
+When multiple collateral tokens are highly correlated, simultaneous adverse price moves are more likely. This concentrates losses in a smaller number of severe scenarios rather than spreading them across independent events.
+
+The model uses a t-Copula (recommended) which, relative to a Gaussian copula, assigns additional probability mass to joint tail events. This means assets are more likely to decline sharply at the same time, consistent with observed crypto market behaviour during stress episodes. Switching from t-Copula to Gaussian copula will mechanically reduce CRR estimates for multi-token portfolios and should be considered a less conservative assumption.
+
+### 9.6 Liquidation Threshold and Bonus
+
+**Lower LT → lower CRR. Higher liquidation bonus → lower CRR.**
+
+A lower liquidation threshold gives the protocol more room to liquidate positions before they become undercollateralised, reducing the probability that price paths reach a point where debt cannot be recovered. A higher liquidation bonus makes each liquidation event more profitable for the liquidator, reducing the probability that the profitability constraint (`profit < 0`) causes a failed liquidation.
+
+These two parameters are not independent in protocol design: a higher bonus increases the liquidator's incentive but also increases the collateral seized per liquidation, which itself increases the liquidation sale size and thus slippage. The model captures this trade-off explicitly, so reducing the bonus to test sensitivity will both reduce slippage and reduce liquidator profitability — the net effect on CRR depends on which channel dominates for the specific portfolio and order book depth.
+
+### 9.7 Defense Mechanisms
+
+**Higher protection → lower net CRR. Gross CRR is unaffected.**
+
+Protection layers (FLC, subsidies, senior tranches) reduce net bad debt by absorbing losses before they fall on the modelled exposure. The model computes both gross bad debt (before any protection) and net bad debt (after protection is applied at the scenario level). CRR is reported on net bad debt by default.
+
+An important implication: if the protection amount is large relative to the typical tail loss, net CRR may be close to zero even when gross CRR is material. In this case, both metrics should be reported to avoid conveying a misleading picture of the underlying risk — the gross figure reflects the structural fragility of the portfolio, while the net figure reflects the effective capital requirement after structural mitigants are taken into account.
+
+### 9.8 Summary Table
+
+| Input change | Direction | Primary channel |
+|---|---|---|
+| Initial LTV ↑ | CRR ↑ | Smaller price drop needed to breach LT |
+| Collateral volatility ↑ | CRR ↑ | Wider simulated price distribution |
+| Forecast horizon ↑ | CRR ↑ | Variance scales with time |
+| Vol floor percentile ↑ | CRR ↑ | Minimum forecast vol increases |
+| Portfolio concentration ↑ | CRR ↑ | Higher slippage + loss of diversification |
+| Order book depth ↑ | CRR ↓ | Lower slippage → more profitable liquidations |
+| Cross-asset correlation ↑ | CRR ↑ | More simultaneous tail events |
+| Copula: Gaussian → t | CRR ↑ | Heavier joint tails |
+| Liquidation threshold ↑ | CRR ↑ | Less buffer before undercollateralisation |
+| Liquidation bonus ↑ | CRR ↓ | Higher profitability, but also higher sale size |
+| Protection (FLC/subsidies) ↑ | Net CRR ↓ | Absorbs losses before they reach the modelled tranche |
 
 ---
 

@@ -100,9 +100,12 @@ class Forecaster:
             name = dist.name.lower()
 
             if "student" in name or "t" in name:
-                df = getattr(dist, "nu", None)
+                # Read nu from the *fitted* parameter vector, not the unfitted
+                # distribution object (which never has the estimated value).
+                params = self.garch_model.params
+                df = params.get("nu", params.get("df", None))
                 if df is None:
-                    df = getattr(dist, "df", 10)  # strong fallback
+                    df = 10.0  # hard fallback
                 return "t", float(df)
 
             else:
@@ -159,8 +162,10 @@ class Forecaster:
             if hasattr(self.garch_model.model, "distribution"):
                 dist = self.garch_model.model.distribution
                 if dist.name.lower().startswith("student"):
-                    df = getattr(dist, "nu", 10)
-                    random_innovations = pd.Series(t.ppf(correlated_uniform, df=df), index=mean_forecast.index)
+                    # Read nu from the *fitted* parameter vector (same fix as _get_garch_distribution)
+                    _params = self.garch_model.params
+                    df = _params.get("nu", _params.get("df", 10.0))
+                    random_innovations = pd.Series(t.ppf(correlated_uniform, df=float(df)), index=mean_forecast.index)
                 else:
                     random_innovations = pd.Series(norm.ppf(correlated_uniform), index=mean_forecast.index)
             
@@ -229,9 +234,12 @@ class Forecaster:
 
         hourly_returns = []
 
-        for t in daily_returns.index:
+        for step_idx, t in enumerate(daily_returns.index):
 
-            rng = np.random.default_rng(None if seed is None else seed + hash(t) % 2**32)
+            # Use the integer step position, not hash(t): hash() is non-deterministic
+            # across Python processes (PYTHONHASHSEED), so the same seed would give
+            # different Brownian bridge paths in different runs.
+            rng = np.random.default_rng(None if seed is None else seed + step_idx)
 
             R_d = daily_returns.loc[t]
             sigma_d = daily_vol.loc[t]
@@ -296,7 +304,6 @@ class Forecaster:
 
         # Step 2: Reconstruct price
 
-        # Change this!
         if not market_df.empty:
             last_price = market_df.loc[market_df['token_symbol'] == token_name, 'oracle_price'].iloc[0]
         else:
@@ -304,7 +311,6 @@ class Forecaster:
 
         if use_log_returns:
             cumsum = forecasted_returns.cumsum()
-            cumsum = cumsum.clip(-np.log(5), np.log(5))
             prices = last_price * np.exp(cumsum)
 
         else:
@@ -413,6 +419,7 @@ class Simulator:
         jump_parameters: pd.DataFrame,
         n_sims: int,
         seed: int,
+        market_df: pd.DataFrame,
         vol_floor_pct: Optional[float] = None,
     ) -> pd.DataFrame:
         
@@ -436,9 +443,12 @@ class Simulator:
             )
 
         else:
-            # Single token → generate simple uniform(0,1) for each scenario and step
+            # Single token → generate simple uniform(0,1) for each scenario and step.
+            # Use a seeded generator so results are reproducible (legacy np.random.uniform
+            # ignores the seed parameter entirely).
             token_name = list(result_per_token.keys())[0]
-            U_single = np.random.uniform(0, 1, size=(n_sims, forecasted_step))
+            _rng = np.random.default_rng(seed)
+            U_single = _rng.uniform(0, 1, size=(n_sims, forecasted_step))
             U_gaussian = {
                 token_name: pd.DataFrame(U_single)
             }
@@ -461,17 +471,22 @@ class Simulator:
                 rolling_vol = full_log_returns.rolling(21).std()
                 token_vol_floor = float(np.percentile(rolling_vol.dropna(), vol_floor_pct * 100))
 
-            def run_simulation(i, _vol_floor=token_vol_floor):
+            # Per-token jump params take priority; fall back to the shared
+            # jump_parameters argument for backwards compatibility with main.py.
+            token_jump_params = result_per_token[token].get("jump_params", jump_parameters)
+
+            def run_simulation(i, _vol_floor=token_vol_floor, _jump_params=token_jump_params):
                 local_seed = seed + i
                 corr_eps_row = corr_residuals.iloc[i % len(corr_residuals), :]
                 forecaster = Forecaster(arima_model, garch_model, local_seed, use_brownian_bridge, _vol_floor)
                 forecasted_prices = forecaster.price_forecasting(
-                    jump_params=jump_parameters,
+                    jump_params=_jump_params,
                     correlated_eps=corr_eps_row,
                     prices_series=price_series,
                     use_log_returns=use_log_returns,
                     forecasted_step=forecasted_step,
-                    token_name=token
+                    token_name=token,
+                    market_df=market_df
                 )
                 return {"prices": forecasted_prices.values}
 

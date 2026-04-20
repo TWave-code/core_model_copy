@@ -1,46 +1,90 @@
+import json
+import os
 import pandas as pd
 import numpy as np
 
 from calibrator import Calibrator
 from forecaster import Simulator
 from liquidator import Liquidator
+from config import load_params
 import importer
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+
+def _load_protection_usd(
+    protocol: str
+) -> float:
+    """
+    Read inputs/protocol_defense.json and return the total USD protection
+    (sum of present loss absorbers) for the given protocol.
+    Returns 0.0 if the file is missing or the protocol has no entry.
+    """
+    defense_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "inputs", "protocol_defense.json"
+    )
+    try:
+        with open(defense_path, "r") as f:
+            data = json.load(f)
+        return float(data.get(protocol.upper(), {}).get("total_protection_usd", 0))
+    except Exception:
+        return 0.0
+
+
 # 0.A - SET FUND AND MODEL PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters are loaded from inputs/default_params.json via config.load_params().
+# To customise a run, either:
+#   (a) edit the values below directly, or
+#   (b) pass a flat JSON file:  load_params(path="my_run.json", overrides={...})
+# ─────────────────────────────────────────────────────────────────────────────
 
-PROTOCOL = "SYRUP"            # can choose between MORPHO, GALAXY, ANCHORAGE, MAPLE AND SPARKLEND
-MORPHO_MARKET = "CBBTC"        # can choose between CBBTC and WETH (only for MORPHO)
-LOAN_TOKEN = "USDC"            # can choose between USDC, USDT, USDS and DAI
-TIME_INTERVAL = "1d"           # Time interval for price data (1d, 1h, etc.)
-FORECAST_STEP = 14             # ° days forecast in order to have something
-TRAIN_SIZE = 90                # Train on 90 days (medium term) to capture volatility dynamics without overfitting on too recent data
-N_MC = 10000                   # Monte Carlo simulation for the forecasted prices
-LIQ_ANALYSIS = "YES"           # Set to NO if you want only to forecast prices
-SAVE_RESULTS = "NO"            # Set to YES if you want to save outputs in csv format
+_p = load_params(overrides={
+    # ── Override any parameter here to deviate from the defaults ──
+    # "PROTOCOL":    "AAVE",
+    # "LOAN_TOKEN":  "USDT",
+    # "N_MC":        5000,
+})
 
-HOURLY_CONV = False            # Whether to convert daily volatility to hourly (True) or keep daily (False)
-USE_LOG_RETURNS = True         # Whether to use log returns (True) or simple returns (False)
-JUMPS = False                  # Whether to include jumps in the price simulations
-FOCUS_ON_NEGATIVE = False      # If True, only downside jumps are applied (more conservative)
-COPULA_TYPE = "T-COPULA"       # Options: "GAUSSIAN", "T-COPULA"
-PERC = 0.975                   # Percentile for liquidation risk metrics (0.95, 0.975, 0.995, ...)
-SEED = 0                       # Random seed for reproducibility
-WORST_CASE = False             # Whether to run worst-case scenario for LTVs (True) or average-case (False)
+PROTOCOL        = _p["PROTOCOL"]        # SYRUP | MORPHO | AAVE | SPARKLEND | GALAXY | ANCHORAGE
+NETWORK         = _p["NETWORK"]         # ETHEREUM | ARBITRUM | OPTIMISM (USELESS VARIABLE IN THIS SCRIPT)
+MORPHO_MARKET   = _p["MORPHO_MARKET"]   # CBBTC | WETH  (MORPHO only)
+GALAXY_TYPE     = _p["GALAXY_TYPE"]     # WITH CLASS A | NO CLASS A  (GALAXY only)
+LOAN_TOKEN      = _p["LOAN_TOKEN"]      # USDC | USDT | USDS | DAI | WETH | WEETH | ALL
+TIME_INTERVAL   = _p["TIME_INTERVAL"]   # 1d | 1h
+FORECAST_STEP   = _p["FORECAST_STEP"]   # forecast horizon in days
+TRAIN_SIZE      = _p["TRAIN_SIZE"]      # GARCH rolling training window in days
+N_MC            = _p["N_MC"]            # Monte Carlo scenarios
+LIQ_ANALYSIS    = _p["LIQ_ANALYSIS"]   # YES | NO
+
+HOURLY_CONV     = _p["HOURLY_CONV"]       # Brownian-bridge hourly decomposition
+USE_LOG_RETURNS = _p["USE_LOG_RETURNS"]   # log returns vs simple returns
+JUMPS           = _p["JUMPS"]             # compound Poisson jump component
+FOCUS_ON_NEGATIVE = _p["FOCUS_ON_NEGATIVE"]  # downside-only jumps
+COPULA_TYPE     = _p["COPULA_TYPE"]       # T-COPULA | GAUSSIAN
+PERC            = _p["PERC"]             # confidence level for VaR/ES diagnostics
+SEED            = _p["SEED"]             # global random seed
+WORST_CASE      = _p["WORST_CASE"]       # worst-case LTVs
 
 results = {}
 
-GAS_FEE_USD = 10.0
-SWAP_FEE_USD = 0.005
-VOL_FLOOR_PCT = 0.75
+GAS_FEE_USD   = _p["GAS_FEE_USD"]    # liquidation gas cost (USD)
+SWAP_FEE_USD  = _p["SWAP_FEE_USD"]   # DEX swap fee (decimal, e.g. 0.005 = 0.5 %)
+VOL_FLOOR_PCT = _p["VOL_FLOOR_PCT"]  # GARCH vol floor percentile
 
+MC_TRIGGER     = _p["MC_TRIGGER"]      # margin-call LTV trigger (SYRUP / ANCHORAGE only)
+MC_TARGET_LTV  = _p["MC_TARGET_LTV"]  # restore-to LTV on cure; None = initial LTV
+MC_CURE_PROB   = _p["MC_CURE_PROB"]   # probability borrower posts collateral when margin-called
+
+print("\nLoading Market and Users Data...\n")
 users_df, market_df = importer.load_protocol_data(
-    PROTOCOL, 
-    LOAN_TOKEN, 
-    morpho_market=MORPHO_MARKET,
-    galaxy_type="no-class-a"
+    protocol = PROTOCOL,
+    network = NETWORK,
+    morpho_market = MORPHO_MARKET,
+    loan_token = LOAN_TOKEN,
+    galaxy_type = GALAXY_TYPE
 )
 if WORST_CASE:
     users_df = importer.change_user_ltvs(users_df, market_df)
@@ -87,6 +131,9 @@ for collateral in collateral_list:
             train_size=TRAIN_SIZE,
             forecast_step=FORECAST_STEP
         )
+
+    print(f"\nBest ARIMA order for {collateral.upper()}: {arima_spec}\n")
+    print(f"\nBest GARCH order for {collateral.upper()}: {garch_spec}\n")
 
     # Add jumps if requested
     if JUMPS:
@@ -142,6 +189,7 @@ all_simulated_prices = Simulator.simulate_prices(
     jump_parameters = JUMP_PARAMS,
     n_sims = N_MC,
     seed = SEED,
+    market_df = market_df,
     vol_floor_pct = VOL_FLOOR_PCT
 )
 
@@ -182,10 +230,18 @@ if LIQ_ANALYSIS.upper() == "YES":
         market_df = market_df
     )
 
+    PROTECTION_USD = _load_protection_usd(PROTOCOL)
+    if PROTECTION_USD > 0:
+        print(f"\nDefense mechanisms loaded: ${PROTECTION_USD/1e6:.1f}M protection applied to net bad debt.\n")
+
     init_positions.simulate_liquidations(
         all_prices = all_simulated_prices,
         product = PROTOCOL,
         swap_fee = SWAP_FEE_USD,
         gas_fee_usd = GAS_FEE_USD,
-        perc = PERC
+        perc = PERC,
+        protection_usd = PROTECTION_USD,
+        margin_call_trigger    = MC_TRIGGER,
+        margin_call_target_ltv = MC_TARGET_LTV,
+        margin_call_cure_prob  = MC_CURE_PROB,
     )

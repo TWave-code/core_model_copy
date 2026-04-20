@@ -1,7 +1,5 @@
 import os
 import pandas as pd
-import yfinance as yf
-from typing import Optional
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Import Market and User Data for each Product
@@ -11,6 +9,7 @@ def load_protocol_data(
     protocol: str,
     loan_token: str,
     *,
+    network: str = "ethereum",
     morpho_market: str = "CBBTC",
     galaxy_type: str = "no-class-a"
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -26,16 +25,19 @@ def load_protocol_data(
     """
     _path = lambda filename: os.path.join("inputs", filename)
     protocol = protocol.lower()
+    network = network.lower()
     if protocol == "morpho":
         loan_token = f"{morpho_market}-{loan_token}".lower()
         users_df = pd.read_parquet(_path(f"users_{protocol}_{loan_token}.parquet"))
         market_df = pd.read_parquet(_path(f"market_{protocol}_{loan_token}.parquet"))
     
     elif protocol == "galaxy":
-        type = galaxy_type.lower()
+        if "no" in galaxy_type.lower():
+            type = "no-class-a"
+        else:
+            type = "w-class-a"
         users_df = pd.read_parquet(_path(f"users_{protocol}_{type}.parquet"))
         market_df = pd.read_parquet(_path(f"market_{protocol}.parquet"))
-    
     
     elif protocol == "anchorage":
         users_df = pd.read_parquet(_path(f"users_{protocol}.parquet"))
@@ -44,7 +46,6 @@ def load_protocol_data(
     else:
         users_df = pd.read_parquet(_path(f"users_{protocol}_{loan_token}.parquet"))
         market_df = pd.read_parquet(_path(f"market_{protocol}_{loan_token}.parquet"))
-    
     
     return users_df, market_df
 
