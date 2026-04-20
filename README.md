@@ -36,7 +36,7 @@ main.py               Entry point — orchestrates the full pipeline
 
 | Step | Module | Description |
 |---|---|---|
-| 1 | `importer.py` | Fetch live borrower positions and market parameters |
+| 1 | `importer.py` | Fetch live borrower positions and market parameters plus price and orderbook data for each modelled token |
 | 2 | `calibrator.py` | Fit ARMA(p,q)-GARCH-family models on daily log returns; select best specification by BIC; validate with ARCH-LM diagnostics and rolling Kupiec / Christoffersen backtests |
 | 3 | `calibrator.py` | Optionally fit a compound Poisson jump process with Student-t jump sizes to tail return observations |
 | 4 | `forecaster.py` / `aggregator.py` | Generate `N_MC` correlated price scenarios via a Gaussian or t-Copula; optionally decompose to hourly resolution using a Brownian bridge |
