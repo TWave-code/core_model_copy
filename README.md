@@ -16,6 +16,37 @@ A quantitative framework for computing the **Capital Requirement Ratio (CRR)** a
 
 ---
 
+## Data Sources
+
+The model draws from three distinct data layers. Each is fetched independently and at a different cadence.
+
+### 1 — Protocol position data
+
+Borrower-level positions (collateral amounts, debt, LTV, liquidation threshold, liquidation bonus) are fetched from parquet files.
+
+### 2 — Price data
+
+All collateral price histories are downloaded from **Yahoo Finance** (`yfinance`, `period="max"`) at calibration time. For the purposes of this script, however, a precomputed snapshot of these prices is loaded from a parquet file.
+
+### 3 — Order book / liquidity data
+
+Order book depth is uploaded from a parquet files. Routing depends on the collateral token:
+
+| Collateral token | Venue type | Source | Notes |
+|---|---|---|---|
+| **CBBTC** | DEX | Uniswap V3 | Pool `0xfB...43ef` (cbBTC/USDC, Base) — on-chain pool state |
+| **HYPE** (and variants) | DEX | HyperLiquid | Native HyperLiquid order book |
+| **ETH and LSTs** (WETH, WEETH, STETH, WSTETH, RETH) | CEX | Aggregated | Proxied via ETH spot book across 11 venues |
+| **BTC and wrappers** (WBTC, LBTC, TBTC) | CEX | Aggregated | Proxied via BTC spot book across 11 venues |
+| **SOL** | CEX | Aggregated | Direct SOL spot book across 11 venues |
+| **All other tokens** | CEX | Aggregated | Direct spot book across 11 venues |
+
+CEX aggregation covers: **Binance, Bybit, OKX, Kraken, Coinbase, Gate.io, KuCoin, Huobi, Bitget, Bitfinex, Crypto.com**.
+
+Liquidity is consumed **cumulatively** across liquidation events within a scenario: each successive liquidation starts from the point in the book where the previous one left off, rather than assuming a fully replenished book.
+
+---
+
 ## Architecture
 
 ```
@@ -36,7 +67,7 @@ main.py               Entry point — orchestrates the full pipeline
 
 | Step | Module | Description |
 |---|---|---|
-| 1 | `importer.py` | Fetch live borrower positions and market parameters plus price and orderbook data for each modelled token |
+| 1 | `importer.py` | Fetch borrower positions and market parameters plus price and orderbook data for each modelled token |
 | 2 | `calibrator.py` | Fit ARMA(p,q)-GARCH-family models on daily log returns; select best specification by BIC; validate with ARCH-LM diagnostics and rolling Kupiec / Christoffersen backtests |
 | 3 | `calibrator.py` | Optionally fit a compound Poisson jump process with Student-t jump sizes to tail return observations |
 | 4 | `forecaster.py` / `aggregator.py` | Generate `N_MC` correlated price scenarios via a Gaussian or t-Copula; optionally decompose to hourly resolution using a Brownian bridge |

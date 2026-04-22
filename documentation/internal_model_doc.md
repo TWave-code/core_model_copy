@@ -46,23 +46,49 @@ All components share a common data flow: calibrated model parameters drive the s
 
 ## 2. Data Inputs
 
-For each market, the model reconstructs the full on-chain state at the simulation start date.
+The model draws from three independent data layers, each fetched from a different source.
 
-**Position-level inputs (per borrower):**
+---
+
+### 2.1 Protocol position data
+
+Borrower-level positions (collateral amounts, debt, LTV, liquidation threshold, liquidation bonus) are fetched from parquet files. Position-level inputs per borrower include:
+
 - Collateral amounts and token identities
 - Borrowed amounts and loan token identities
 - Current LTV and Health Factor
 - Liquidation threshold and liquidation bonus
 
-**Market-level inputs (per collateral asset):**
-- Daily OHLCV price history (sourced from Yahoo Finance)
-- Oracle price at simulation start
-- Real-time order book depth from 12+ CEX venues and Uniswap V3
+| Protocol | Source | Granularity |
+|---|---|---|
+| Morpho, Aave, SparkLend, Maple (Syrup), Galaxy, Anchorage | Local parquet files (`inputs/*.parquet`) | Per-position static file |
 
-**Protocol parameters:**
-- Close factor rules (Aave / SparkLend)
-- Partial liquidation formula parameters (Morpho)
-- Gas fee and swap fee assumptions
+Protocol parameters used by the liquidation engine (close-factor rules, partial liquidation formulas, gas and swap fee assumptions) are hard-coded per protocol in `liquidator.py` and configurable via `GAS_FEE_USD` and `SWAP_FEE_USD`.
+
+---
+
+### 2.2 Price data
+
+All collateral price histories are downloaded from **Yahoo Finance** (`yfinance`, `period="max"`) at calibration time. For the purposes of this script, however, a precomputed snapshot of these prices is loaded from a parquet file.
+
+---
+
+### 2.3 Order book / liquidity data
+
+Order book depth is uploaded from a parquet files. Routing depends on the collateral token:
+
+| Collateral token | Venue type | Source | Detail |
+|---|---|---|---|
+| **CBBTC** | DEX | Uniswap V3 | Pool `0xfBB...43ef` (cbBTC/USDC, Base) — live on-chain pool state |
+| **HYPE** (and variants) | DEX | HyperLiquid | Native HyperLiquid order book |
+| **ETH and LSTs** (WETH, WEETH, STETH, WSTETH, RETH) | CEX | Aggregated | Proxied via ETH spot book |
+| **BTC and wrappers** (WBTC, LBTC, TBTC) | CEX | Aggregated | Proxied via BTC spot book |
+| **SOL** | CEX | Aggregated | Direct SOL spot book |
+| **All other tokens** | CEX | Aggregated | Direct spot book |
+
+CEX aggregation covers **11 venues**: Binance, Bybit, OKX, Kraken, Coinbase, Gate.io, KuCoin, Huobi, Bitget, Bitfinex, Crypto.com.
+
+Liquidity is consumed **cumulatively** within each scenario: each successive liquidation starts from the point in the order book where the previous one left off. This is conservative - it reflects a stress scenario where sequential liquidations face progressively depleted depth, rather than assuming the book replenishes between events.
 
 ---
 
