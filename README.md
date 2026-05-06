@@ -6,6 +6,12 @@ Note that CRR is an expected loss, not a tail loss by construction. However, the
 
 ---
 
+## Note
+
+This repository contains an illustrative version of the model. It is not the live instance used by BA Labs for production CRR calculations, but is intended to give the reader a concrete understanding of the model's input structure and logic.
+
+---
+
 ## Supported Protocols
 
 | Protocol | Data Source |
@@ -188,17 +194,6 @@ Slippage is modelled from aggregated real-time order books across 12+ CEX venues
 | **Delta LTV** | `PERC`-quantile of the maximum LTV overshoot above the liquidation threshold |
 
 CRR (EL) is the headline metric. It equals `PD × LGD` in Basel notation — the expected cost of lending expressed as a fraction of total exposure. It is stable under borrower concentration and directly comparable across protocols and market segments. VaR and ES of the bad-debt distribution are computed internally and available as diagnostics but are not the primary output.
-
----
-
-## Further Developments
-
-The following extensions are under consideration for future model iterations:
-
-- Idle capital risk — stablecoins: extension of the CRR framework to cover idle capital held in stablecoins, which is currently excluded from the model perimeter.
-- Idle capital risk and collateral — RWA tokens: integration of tokenised real-world assets both as a form of idle capital and as accepted collateral, accounting for the distinct risk structure of these instruments relative to native crypto assets.
-- PT tokens: extension of the liquidation and price simulation framework to cover fixed-rate DeFi instruments whose price dynamics depend on both interest rate movements and protocol credit risk.
-- DEX liquidity integration: broader coverage of decentralised exchange venues for order book depth aggregation, relevant for collateral tokens whose liquidity resides primarily or exclusively on-chain.
 
 ---
 
