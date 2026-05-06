@@ -230,7 +230,7 @@ class Liquidator:
         tot_debt   : total loan exposure in USD (denominator for CRR)
         perc       : confidence level for VaR / ES (e.g. 0.975 = 97.5th pct)
         users_df   : borrower-level DataFrame — used to compute concentration metrics
-                    (HHI, top-1 share). Optional; metrics are None if not provided.
+                     (HHI, top-1 share). Optional; metrics are None if not provided.
 
         Returns
         -------
@@ -246,7 +246,7 @@ class Liquidator:
             crr_es              : float | None — CRR ES  at confidence level (%)
             es_el_ratio         : float | None — crr_es / mean_crr (concentration diagnostic)
             hhi                 : float | None — Herfindahl-Hirschman Index of borrower
-                                                exposures (0=granular, 1=single borrower)
+                                                 exposures (0=granular, 1=single borrower)
             top1_share          : float | None — largest single borrower's share of tot_debt
             n_borrowers         : int   | None — number of active borrowers
         """
@@ -299,6 +299,7 @@ class Liquidator:
 
         # ── Concentration metrics from borrower-level data ────────────────────
         hhi = top1_share = n_borrowers = None
+        _CRR_HHI_K: float = 1.0
         if (
             users_df is not None
             and not users_df.empty
@@ -316,11 +317,10 @@ class Liquidator:
         # CRR_adj = EL × (1 + k × HHI)
         #   HHI = 0  (granular)     : CRR_adj = EL
         #   HHI = 1  (single name)  : CRR_adj = EL × (1 + k)   e.g. 2×EL when k=1
-        # crr_adj = None
-        # _CRR_HHI_K = 1.0  # tunable parameter for how much to adjust CRR based on HHI
-        # if mean_crr is not None:
-        #     _w      = hhi if hhi is not None else 0.0
-        #     crr_adj = round(mean_crr * (1 + _CRR_HHI_K * _w), 6)
+        crr_adj = None
+        if mean_crr is not None:
+            _w      = hhi if hhi is not None else 0.0
+            crr_adj = round(mean_crr * (1 + _CRR_HHI_K * _w), 6)
 
         return {
             "n_scenarios":       n,
@@ -330,6 +330,7 @@ class Liquidator:
             "max_bad_debt_pct":  max_bad_debt_pct,
             "mean_bad_debt_usd": mean_bad_debt_usd,
             "mean_crr":          mean_crr,
+            "crr_adj":           crr_adj,
             "crr_var":           crr_var,
             "crr_es":            crr_es,
             "es_el_ratio":       es_el_ratio,
@@ -354,13 +355,13 @@ class Liquidator:
     ) -> dict:
         """
         margin_call_trigger      : pp buffer below LT that triggers a margin call.
-                                A position triggers when LTV >= LT - margin_call_trigger.
-                                Default 0.05 means margin call fires at LTV >= LT - 5pp.
+                                   A position triggers when LTV >= LT - margin_call_trigger.
+                                   Default 0.05 means margin call fires at LTV >= LT - 5pp.
         margin_call_target_ltv   : LTV the borrower restores to on cure.
-                                None (default) → restore to the borrower's initial LTV.
-                                A float (e.g. LT - 0.15) → restore to that fixed target.
+                                   None (default) → restore to the borrower's initial LTV.
+                                   A float (e.g. LT - 0.15) → restore to that fixed target.
         margin_call_cure_prob    : probability that a borrower in the margin-call zone
-                                actually cures (posts collateral). Default 0.8.
+                                   actually cures (posts collateral). Default 0.8.
         """
         """
         Profit-aware simulation with 'count bad debt once' semantics.
@@ -644,7 +645,7 @@ class Liquidator:
                 R = np.where(do_exec, R_req, 0.0)
                 seized_collat_usd = (one_plus_bonus * R)
                 each_user_loss += liq_bonus * R
-            
+               
                 D_adj  -= R
                 CV_adj -= seized_collat_usd
 
@@ -716,7 +717,7 @@ class Liquidator:
         })
 
         summary_df = summary[['scenario', 'max_delta_ltv', 'net_bad_debt_total', 'gross_bad_debt_total',
-                            'max_pct_loss', 'prob_of_liq', 'prob_of_default']].copy().reset_index(drop=True)
+                              'max_pct_loss', 'prob_of_liq', 'prob_of_default']].copy().reset_index(drop=True)
         
         bad_debt_var = np.quantile(summary_df['net_bad_debt_total'], perc, method='inverted_cdf')
         bad_debt_var_gross = np.quantile(summary_df['gross_bad_debt_total'], perc, method='inverted_cdf')
@@ -780,13 +781,13 @@ class Liquidator:
                 _hhi    = float((_shares ** 2).sum())
 
         _w          = _hhi if _hhi is not None else 0.0
-        # _CRR_HHI_K: float = 1.0
         # crr_adj_raw = crr_el_raw * (1 + _CRR_HHI_K * _w)
 
         # print(f"\nCRR as Net ES at {perc:.2%}: {es:.4%}")
         # print(f"CRR as Gross ES at {perc:.2%}: {es_gross:.4%}")
         # print(f"CRR as VaR at {perc:.2%}: {crr:.4%}")
         print(f"CRR as EL: {crr_el_raw:.4%}")
+        print(f"HHI: {_hhi:.4%}" if _hhi is not None else "HHI: N/A")
         # print(f"PL at {perc:.2%}: {np.quantile(summary_df['prob_of_liq'], perc, method='inverted_cdf'):.4%}")
         # print(f"PD at {perc:.2%}: {np.quantile(summary_df['prob_of_default'], perc, method='inverted_cdf'):.4%}")
         print(f"Delta LTV at {perc:.2%}: {np.quantile(summary_df['max_delta_ltv'], perc, method='inverted_cdf'):.4%}\n")
@@ -796,5 +797,5 @@ class Liquidator:
             "crr_el":     round(crr_el_raw  * 100, 6),   # % units
             "crr_es":     round(es          * 100, 6),   # % units
             "crr_var":    round(crr         * 100, 6),   # % units
-            "hhi":        round(_hhi, 6) if _hhi is not None else None,
+            "hhi":        round(_hhi        * 100, 6) if _hhi is not None else None,
         }

@@ -4,7 +4,11 @@
 
 ## TL;DR
 
-The Collateralized Onchain Risk Engine (CORE) is a modular Monte Carlo stress-testing framework designed to quantify downside risk in over-collateralised lending protocols. It simulates many possible future price paths for collateral assets, checks every borrower position step by step, executes liquidations subject to realistic market frictions, and measures how much bad debt accumulates.
+The Collateralized Onchain Risk Engine (CORE) is a modular Monte Carlo stress-testing framework designed to quantify downside risk in over-collateralised lending protocols. It simulates many possible future price paths for collateral assets, checks every borrower position step by step, executes liquidations subject to realistic market frictions, and measures how much bad debt accumulates on average in the distribution given stressed conditions.
+
+Note that CRR is an expected loss, not a tail loss by construction. However, the inputs that generate bad debt in the model are deliberately conservative: volatility is floored at its 75th historical percentile, liquidity is consumed cumulatively across sequential liquidations without replenishment, and joint tail events across collateral assets are modelled using a t-Copula that assigns materially higher probability to simultaneous crashes than standard correlation assumptions: a bad debt event in this model already presupposes a severe stress scenario.
+
+Tail metrics such as VaR and Expected Shortfall are computed internally but are not reported as primary outputs. In over-collateralised lending, the loss distribution has a specific shape: the vast majority of scenarios produce zero bad debt, while a small fraction of tail scenarios produce very large losses. In this setting, VaR is largely uninformative: it will read zero for most reasonable confidence levels, since the quantile sits in the zero-mass region of the distribution. ES, on the other hand, is computed only over the loss tail and is therefore highly sensitive to the exact composition of the portfolio: a single new borrower entering at a high LTV, or a new collateral token with thin liquidity, can cause a step-change in ES that is disproportionate to their actual weight in the book. This instability makes tail metrics unreliable as a day-to-day monitoring tool in a portfolio that is repriced daily. Expected loss integrates across the entire scenario distribution, including the large zero-loss mass, and produces a figure that moves smoothly and meaningfully as the portfolio evolves, while still reflecting the conservative stress assumptions embedded in the simulation.
 
 The model answers three practical questions:
 - **How often do positions get liquidated?** (Probability of Liquidation, PL)
@@ -155,7 +159,35 @@ vol_floor = Percentile(rolling_21d_std(r_t, full history), VOL_FLOOR_PCT)
 
 The floor is computed from the **full historical price series** (not the training window), ensuring it remains stable regardless of the window size used for model estimation. `VOL_FLOOR_PCT = 0.75` corresponds to the 75th percentile of historical realised volatility, keeping the model in the upper half of observed conditions.
 
-### 3.6 Jump Component (Optional)
+### 3.6 Lindy Volatility Scaling (Optional)
+
+When `LINDY_ALPHA > 0`, a per-token uncertainty premium is applied multiplicatively to the GARCH conditional volatility forecast before innovations are sampled:
+
+```
+lindy_factor = min(LINDY_MAX_FACTOR,  max(1.0,  (LINDY_REF_DAYS / n_obs)^LINDY_ALPHA))
+σ̂_t  ←  σ̂_t × lindy_factor
+```
+
+**Rationale.** GARCH parameter estimates carry wide confidence intervals when the training sample is short. A token with only 6 months of price history may have its GARCH fit dominated by a single bull market, giving conditional volatility forecasts that understate tail risk relative to a token with 5+ years of diverse regime coverage. The Lindy factor compensates by scaling up the vol forecast in proportion to the shortfall in history, making capital requirements more conservative when data is sparse.
+
+| Parameter | Role |
+|---|---|
+| `LINDY_ALPHA` | Decay exponent; `0.0` = disabled (factor = 1.0 always); `0.5` = square-root decay (recommended) |
+| `LINDY_REF_DAYS` | History length (days) at which factor = 1.0; default 1825 (≈ 5 years of daily data) |
+| `LINDY_MAX_FACTOR` | Hard cap on the multiplier; default 2.0 prevents extreme inflation for brand-new assets |
+
+Example factors at α = 0.5, ref = 1825 d, cap = 2.0:
+
+| Token | History | factor |
+|---|---|---|
+| BTC / ETH | ≥ 5 y | 1.00 |
+| SOL | ≈ 3 y | 1.29 |
+| WIF / PENDLE | ≈ 2 y | 1.58 |
+| HYPE (6 m) | ≈ 180 d | 2.00 (capped) |
+
+When `LINDY_ALPHA = 0.0` (the default), the factor is always 1.0 and the feature is a strict no-op — it has zero effect on any model output.
+
+### 3.7 Jump Component (Optional)
 
 When `JUMPS = True`, a compound Poisson jump process is added to the return:
 
@@ -330,6 +362,7 @@ VaR and ES are computed internally and remain available as diagnostics in `Liqui
 | ARMA retained when no ARCH effects | When no heteroskedasticity is detected, skipping GARCH does not mean discarding the mean model — the fitted ARMA is preserved and residuals are scaled by historical volatility, which is strictly better than reverting to a constant-mean random walk |
 | t-Copula over Gaussian | Crypto assets exhibit strong tail co-dependence; a Gaussian copula underestimates the probability of simultaneous crashes |
 | Volatility floor from full history | A floor computed from the training window is self-referential and moves with window size; anchoring to the full series gives a stable long-run stress reference |
+| Lindy vol scaling disabled by default | The feature is a conservative add-on, not a baseline assumption. It is off (`LINDY_ALPHA = 0.0`) by default so that standard outputs remain directly comparable with prior model runs. Analysts may activate it (recommended α = 0.5) when assessing portfolios that include newly listed tokens with limited price history |
 | Spearman over Pearson for correlation | Robust to outliers; captures monotonic relationships without requiring linearity |
 
 ### Known limitations
@@ -420,6 +453,7 @@ An important implication: if the protection amount is large relative to the typi
 | Collateral volatility ↑ | CRR ↑ | Wider simulated price distribution |
 | Forecast horizon ↑ | CRR ↑ | Variance scales with time |
 | Vol floor percentile ↑ | CRR ↑ | Minimum forecast vol increases |
+| Lindy α ↑ (for short-history tokens) | CRR ↑ | Uncertainty premium scales up conditional vol |
 | Portfolio concentration ↑ | CRR ↑ | Higher slippage + loss of diversification |
 | Order book depth ↑ | CRR ↓ | Lower slippage → more profitable liquidations |
 | Cross-asset correlation ↑ | CRR ↑ | More simultaneous tail events |
@@ -427,6 +461,17 @@ An important implication: if the protection amount is large relative to the typi
 | Liquidation threshold ↑ | CRR ↑ | Less buffer before undercollateralisation |
 | Liquidation bonus ↑ | CRR ↓ | Higher profitability, but also higher sale size |
 | Protection (FLC/subsidies) ↑ | Net CRR ↓ | Absorbs losses before they reach the modelled tranche |
+
+---
+
+## 10. Further Developments
+
+The following extensions are under consideration for future model iterations:
+
+- Idle capital risk — stablecoins: extension of the CRR framework to cover idle capital held in stablecoins, which is currently excluded from the model perimeter.
+- Idle capital risk and collateral — RWA tokens: integration of tokenised real-world assets both as a form of idle capital and as accepted collateral, accounting for the distinct risk structure of these instruments relative to native crypto assets.
+- PT tokens: extension of the liquidation and price simulation framework to cover fixed-rate DeFi instruments whose price dynamics depend on both interest rate movements and protocol credit risk.
+- DEX liquidity integration: broader coverage of decentralised exchange venues for order book depth aggregation, relevant for collateral tokens whose liquidity resides primarily or exclusively on-chain.
 
 ---
 

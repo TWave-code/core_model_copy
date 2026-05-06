@@ -1,6 +1,8 @@
 # CORE - Collateralized Onchain Risk Engine
 
-A quantitative framework for computing the **Capital Requirement Ratio (CRR)** across over-collateralised DeFi lending protocols. The model combines ARMA-GARCH price simulation, copula-based cross-asset correlation, an optional compound Poisson jump component, and full liquidation mechanics to estimate the **Expected Loss (EL)** of bad-debt exposure — the primary risk metric — together with concentration diagnostics based on the Herfindahl-Hirschman Index (HHI) of borrower exposures.
+A quantitative framework for computing the **Capital Requirement Ratio (CRR)** across over-collateralised DeFi lending protocols. The model combines ARMA-GARCH price simulation, copula-based cross-asset correlation, an optional compound Poisson jump component, and full liquidation mechanics to estimate the **Expected Loss (EL)** of bad-debt exposure (the primary risk metric) together with concentration diagnostics based on the Herfindahl-Hirschman Index (HHI) of borrower exposures.
+
+Note that CRR is an expected loss, not a tail loss by construction. However, the inputs that generate bad debt in the model are deliberately conservative: volatility is floored at its 75th historical percentile, liquidity is consumed cumulatively across sequential liquidations without replenishment, and joint tail events across collateral assets are modelled using a t-Copula that assigns materially higher probability to simultaneous crashes than standard correlation assumptions: a bad debt event in this model already presupposes a severe stress scenario.
 
 ---
 
@@ -52,7 +54,7 @@ Liquidity is consumed **cumulatively** across liquidation events within a scenar
 ```
 main.py               Entry point — orchestrates the full pipeline
 │
-├── importer.py       Protocol-specific data loaders (users + market data) and prices / orderbook data
+├── importer.py       Protocol-specific data loaders (users + market data) plus prices and orderbook data
 │
 ├── calibrator.py     ARMA / GARCH-family model selection, diagnostics, backtesting
 │   └── backtester.py Rolling VaR backtests (Kupiec + Christoffersen)
@@ -80,7 +82,7 @@ main.py               Entry point — orchestrates the full pipeline
 | Parameter | Default | Description |
 |---|---|---|
 | `PROTOCOL` | `MORPHO` | Target protocol |
-| `NETWORK` | `ETHEREUM` | Target network (useless in this script) |
+| `NETWORK` | `ETHEREUM` | Target network |
 | `FORECAST_STEP` | `14` | Forecast horizon (days) |
 | `TRAIN_SIZE` | `180` | Rolling training window (days) |
 | `N_MC` | `10 000` | Monte Carlo scenarios |
@@ -91,6 +93,9 @@ main.py               Entry point — orchestrates the full pipeline
 | `JUMPS` | `False` | Include compound Poisson jump component |
 | `FOCUS_ON_NEGATIVE` | `False` | Restrict jump simulation to downside only |
 | `VOL_FLOOR_PCT` | `0.75` | Floor GARCH forecast vol at this percentile of the full historical rolling vol |
+| `LINDY_ALPHA` | `0.0` | Lindy vol scaling exponent — `0.0` = disabled; `0.5` = square-root decay (recommended starting point) |
+| `LINDY_REF_DAYS` | `1825` | Reference history length (days) at which the Lindy factor equals 1.0 (≈ 5 years) |
+| `LINDY_MAX_FACTOR` | `2.0` | Hard cap on the Lindy vol multiplier |
 | `WORST_CASE` | `False` | Use worst-case LTVs instead of observed LTVs |
 | `LOAN_TOKEN` | `USDC` | Filter positions by loan token (`ALL` = no filter) |
 | `SEED` | `0` | Global random seed |
@@ -120,6 +125,26 @@ The GARCH gate is determined by an **ARCH-LM test** on the return residuals: GAR
 ### Volatility Floor
 
 To prevent capital requirements from collapsing during low-volatility regimes, the GARCH conditional volatility forecast is floored at the `VOL_FLOOR_PCT` percentile of the 21-day rolling realised volatility computed over the **full historical series** (not just the training window). This decouples the floor from the training window choice and provides a stable long-run anchor.
+
+### Lindy Volatility Scaling (optional)
+
+When `LINDY_ALPHA > 0`, a multiplicative uncertainty premium is applied to the GARCH conditional volatility forecast for assets whose price history is shorter than `LINDY_REF_DAYS`:
+
+```
+lindy_factor = min(LINDY_MAX_FACTOR,  max(1.0,  (LINDY_REF_DAYS / n_obs) ^ LINDY_ALPHA))
+vol_forecast = vol_forecast × lindy_factor
+```
+
+The rationale is that GARCH parameters estimated on a short history carry wide confidence intervals, and the sample may cover only a single market regime. Tokens with longer histories (≥ `LINDY_REF_DAYS` days) receive a factor of 1.0 — no adjustment. Tokens with shorter histories receive a factor > 1.0, scaled by the exponent `LINDY_ALPHA`:
+
+| Token (examples with α = 0.5, ref = 1825 d) | n_obs | Lindy factor |
+|---|---|---|
+| BTC / ETH (≥ 5 years) | ≥ 1825 | 1.00 |
+| SOL (≈ 3 years) | ≈ 1095 | 1.29 |
+| WIF / PENDLE (≈ 2 years) | ≈ 730 | 1.58 |
+| HYPE (≈ 6 months) | ≈ 180 | 2.00 (capped) |
+
+`LINDY_ALPHA = 0.0` (the default) disables the feature entirely — the factor is always 1.0 with no effect on model output.
 
 ---
 
@@ -152,19 +177,6 @@ Slippage is modelled from aggregated real-time order books across 12+ CEX venues
 
 ---
 
-## Multi-Loan Positions (Aave / SparkLend)
-
-When a wallet borrows multiple assets, `explode_by_loan_token()` creates one synthetic sub-position per loan token, re-weighting collateral by each loan's share of total borrow. This preserves LTV and Health Factor invariants:
-
-```
-LTV_token = D_token / (C × share)  =  D_total / C       (unchanged)
-HF_token  = (C × share × LT) / D_token                   (unchanged)
-```
-
-Setting `LOAN_TOKEN = "ALL"` analyses the full mixed-borrow portfolio; setting it to a specific token isolates that market.
-
----
-
 ## Risk Metrics
 
 | Metric | Definition |
@@ -175,7 +187,18 @@ Setting `LOAN_TOKEN = "ALL"` analyses the full mixed-borrow portfolio; setting i
 | **PD** | `PERC`-quantile of the fraction of positions generating bad debt |
 | **Delta LTV** | `PERC`-quantile of the maximum LTV overshoot above the liquidation threshold |
 
-CRR (EL) is the headline metric. It equals `PD × LGD × EAD` in Basel notation — the expected cost of lending expressed as a fraction of total exposure. It is stable under borrower concentration and directly comparable across protocols and market segments. VaR and ES of the bad-debt distribution are computed internally and available as diagnostics but are not the primary output.
+CRR (EL) is the headline metric. It equals `PD × LGD` in Basel notation — the expected cost of lending expressed as a fraction of total exposure. It is stable under borrower concentration and directly comparable across protocols and market segments. VaR and ES of the bad-debt distribution are computed internally and available as diagnostics but are not the primary output.
+
+---
+
+## Further Developments
+
+The following extensions are under consideration for future model iterations:
+
+- Idle capital risk — stablecoins: extension of the CRR framework to cover idle capital held in stablecoins, which is currently excluded from the model perimeter.
+- Idle capital risk and collateral — RWA tokens: integration of tokenised real-world assets both as a form of idle capital and as accepted collateral, accounting for the distinct risk structure of these instruments relative to native crypto assets.
+- PT tokens: extension of the liquidation and price simulation framework to cover fixed-rate DeFi instruments whose price dynamics depend on both interest rate movements and protocol credit risk.
+- DEX liquidity integration: broader coverage of decentralised exchange venues for order book depth aggregation, relevant for collateral tokens whose liquidity resides primarily or exclusively on-chain.
 
 ---
 
@@ -217,7 +240,7 @@ Selected GARCH model: GJR-GARCH
 Running Monte-Carlo Simulations for Prices...
 
 Simulated Prices Statistics for WBTC:
-            2026-04-10     2026-04-23
+              2026-04-10     2026-04-23
 mean        71,760.99      72,132.22
 std          1,511.87       6,727.74
 min         66,598.84      50,401.83
@@ -226,10 +249,24 @@ max         78,439.61      99,453.16
 Running Monte-Carlo for Liquidations...
 
 CRR as EL (Basel):     2.34%
-HHI (concentration):   0.142
-PL         at 99.50%:  50.00%
-PD         at 99.50%:  50.00%
-Delta LTV  at 99.50%:  26.50%
+HHI (concentration):   14.2%
+PL         at 97.50%:  50.00%
+PD         at 97.50%:  50.00%
+Delta LTV  at 97.50%:  26.50%
+```
+
+---
+
+## Input Files (Galaxy / Anchorage)
+
+For protocols without a live API, place CSV files in the `inputs/` folder:
+
+```
+inputs/
+├── galaxy_users.csv
+├── galaxy_market.csv
+├── anchorage_users.csv
+└── anchorage_market.csv
 ```
 
 ---
@@ -248,11 +285,10 @@ CORE/
 ├── requirements.txt
 ├── README.md
 ├── inputs/
-│   ├── galaxy_users.parquet
-│   ├── galaxy_market.parquet
-│   ├── anchorage_users.parquet
-|   ├── anchorage_market.parquet
-│   └── ...
+│   ├── galaxy_users.csv
+│   ├── galaxy_market.csv
+│   ├── anchorage_users.csv
+│   └── anchorage_market.csv
 ├── documentation/
     └── internal_model_doc.md
 ```

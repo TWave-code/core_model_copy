@@ -25,6 +25,46 @@ from backtester import Backtester
 from aggregator import Aggregator
 
 
+def compute_lindy_factor(
+    n_obs: int,
+    alpha: float = 0.0,
+    ref_days: int = 1825,
+    max_factor: float = 2.0,
+) -> float:
+    """
+    Lindy volatility scaling factor — uncertainty premium for assets with short price histories.
+
+    factor = min(max_factor,  max(1.0,  (ref_days / n_obs) ^ alpha))
+
+    Rationale
+    ---------
+    GARCH parameters estimated on a short history carry wide confidence intervals,
+    and the observed sample may cover only a single market regime (e.g. a bull run).
+    The Lindy factor compensates by scaling up the conditional vol forecast, making
+    capital requirements more conservative when data is sparse.
+
+    Parameters
+    ----------
+    n_obs       : number of daily price observations available for calibration
+    alpha       : decay exponent; 0.0 = disabled (returns 1.0 always)
+                  0.5 = square-root — recommended starting point
+    ref_days    : history length at which factor = 1.0 (default: 1825 = ~5 years)
+    max_factor  : hard cap; prevents extreme inflation for very new assets
+
+    Examples (alpha=0.5, ref_days=1825, max_factor=2.0)
+    -------------------------------------------------------
+    BTC / ETH   (≥5 y, ≥1825 obs) → 1.00
+    SOL         (~3 y, ~1095 obs) → 1.29
+    WIF / PENDLE (~2 y, ~730 obs) → 1.58
+    HYPE        (~6 m, ~180 obs)  → 2.00  (capped)
+    brand-new   (<3 m, <90 obs)   → 2.00  (capped)
+    """
+    if alpha == 0.0 or n_obs >= ref_days:
+        return 1.0
+    raw = (ref_days / max(1, n_obs)) ** alpha
+    return float(min(max_factor, max(1.0, raw)))
+
+
 class Forecaster:
 
 
@@ -35,6 +75,7 @@ class Forecaster:
         seed: int,
         use_brownian_bridge: Optional[bool] = False,
         vol_floor: Optional[float] = None,
+        lindy_factor: float = 1.0,
     ):
         self.arma_model = arma_model
         self.garch_model = garch_model
@@ -47,6 +88,11 @@ class Forecaster:
         # Computed externally from the full historical series so it is stable
         # and independent of the training window choice.
         self.vol_floor = vol_floor
+
+        # Lindy factor: uncertainty premium applied to the conditional vol
+        # forecast for assets with short price histories (see compute_lindy_factor).
+        # 1.0 = no adjustment (default; corresponds to LINDY_ALPHA=0.0).
+        self.lindy_factor = lindy_factor
 
 
     def _sample_norm(
@@ -158,7 +204,12 @@ class Forecaster:
 
             if self.vol_floor is not None:
                 vol_forecast = vol_forecast.clip(lower=self.vol_floor)
-    
+
+            # Lindy factor: scale up vol for assets with short price history.
+            # factor = 1.0 when LINDY_ALPHA = 0.0 (disabled) → no-op.
+            if self.lindy_factor != 1.0:
+                vol_forecast = vol_forecast * self.lindy_factor
+
             if hasattr(self.garch_model.model, "distribution"):
                 dist = self.garch_model.model.distribution
                 if dist.name.lower().startswith("student"):
@@ -304,7 +355,7 @@ class Forecaster:
 
         # Step 2: Reconstruct price
 
-        if not market_df.empty:
+        if (not market_df.empty) and (token_name in market_df['token_symbol'].values):
             last_price = market_df.loc[market_df['token_symbol'] == token_name, 'oracle_price'].iloc[0]
         else:
             last_price = prices_series.iloc[-1].item()
@@ -421,6 +472,9 @@ class Simulator:
         seed: int,
         market_df: pd.DataFrame,
         vol_floor_pct: Optional[float] = None,
+        lindy_alpha: float = 0.0,
+        lindy_ref_days: int = 1825,
+        lindy_max_factor: float = 2.0,
     ) -> pd.DataFrame:
         
         if len(result_per_token) > 1:
@@ -475,10 +529,19 @@ class Simulator:
             # jump_parameters argument for backwards compatibility with main.py.
             token_jump_params = result_per_token[token].get("jump_params", jump_parameters)
 
-            def run_simulation(i, _vol_floor=token_vol_floor, _jump_params=token_jump_params):
+            # Lindy factor: uncertainty premium for assets with short price history.
+            # Returns 1.0 when lindy_alpha=0.0 (disabled) → no change to behaviour.
+            token_lindy_factor = compute_lindy_factor(
+                n_obs=len(price_series),
+                alpha=lindy_alpha,
+                ref_days=lindy_ref_days,
+                max_factor=lindy_max_factor,
+            )
+
+            def run_simulation(i, _vol_floor=token_vol_floor, _jump_params=token_jump_params, _lindy=token_lindy_factor):
                 local_seed = seed + i
                 corr_eps_row = corr_residuals.iloc[i % len(corr_residuals), :]
-                forecaster = Forecaster(arima_model, garch_model, local_seed, use_brownian_bridge, _vol_floor)
+                forecaster = Forecaster(arima_model, garch_model, local_seed, use_brownian_bridge, _vol_floor, _lindy)
                 forecasted_prices = forecaster.price_forecasting(
                     jump_params=_jump_params,
                     correlated_eps=corr_eps_row,
